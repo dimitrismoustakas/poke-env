@@ -14,6 +14,61 @@ from poke_env.player.battle_order import (
     SingleBattleOrder,
 )
 
+# Precomputed target position tables for each active slot, avoiding redundant
+# Target.from_showdown_message() calls (regex + string manipulation) on every
+# get_possible_showdown_targets() invocation. Keys are Target enum members,
+# the int EMPTY_TARGET_POSITION (0), or None. Positions use the fixed class
+# constants: POKEMON_1_POSITION=-1, POKEMON_2_POSITION=-2,
+# OPPONENT_1_POSITION=1, OPPONENT_2_POSITION=2, EMPTY_TARGET_POSITION=0.
+_EMPTY = 0   # DoubleBattle.EMPTY_TARGET_POSITION
+_P1 = -1     # DoubleBattle.POKEMON_1_POSITION  (slot 0 self / slot 1 ally)
+_P2 = -2     # DoubleBattle.POKEMON_2_POSITION  (slot 0 ally / slot 1 self)
+_O1 = 1      # DoubleBattle.OPPONENT_1_POSITION
+_O2 = 2      # DoubleBattle.OPPONENT_2_POSITION
+
+_TARGET_POSITIONS: tuple = (
+    # Index 0 — slot 0 is active (self=_P1, ally=_P2)
+    {
+        Target.ADJACENT_ALLY:         [_P2],
+        Target.ADJACENT_ALLY_OR_SELF: [_P2, _P1],
+        Target.ADJACENT_FOE:          [_O1, _O2],
+        Target.ALL:                   [_EMPTY],
+        Target.ALL_ADJACENT:          [_EMPTY],
+        Target.ALL_ADJACENT_FOES:     [_EMPTY],
+        Target.ALLIES:                [_EMPTY],
+        Target.ALLY_SIDE:             [_EMPTY],
+        Target.ALLY_TEAM:             [_EMPTY],
+        Target.ANY:                   [_P2, _O1, _O2],
+        Target.FOE_SIDE:              [_EMPTY],
+        Target.NORMAL:                [_P2, _O1, _O2],
+        Target.RANDOM_NORMAL:         [_EMPTY],
+        Target.SCRIPTED:              [_EMPTY],
+        Target.SELF:                  [_EMPTY],
+        _EMPTY:                       [_EMPTY],
+        None:                         [_O1, _O2],
+    },
+    # Index 1 — slot 1 is active (self=_P2, ally=_P1)
+    {
+        Target.ADJACENT_ALLY:         [_P1],
+        Target.ADJACENT_ALLY_OR_SELF: [_P1, _P2],
+        Target.ADJACENT_FOE:          [_O1, _O2],
+        Target.ALL:                   [_EMPTY],
+        Target.ALL_ADJACENT:          [_EMPTY],
+        Target.ALL_ADJACENT_FOES:     [_EMPTY],
+        Target.ALLIES:                [_EMPTY],
+        Target.ALLY_SIDE:             [_EMPTY],
+        Target.ALLY_TEAM:             [_EMPTY],
+        Target.ANY:                   [_P1, _O1, _O2],
+        Target.FOE_SIDE:              [_EMPTY],
+        Target.NORMAL:                [_P1, _O1, _O2],
+        Target.RANDOM_NORMAL:         [_EMPTY],
+        Target.SCRIPTED:              [_EMPTY],
+        Target.SELF:                  [_EMPTY],
+        _EMPTY:                       [_EMPTY],
+        None:                         [_O1, _O2],
+    },
+)
+
 
 class DoubleBattle(AbstractBattle):
     POKEMON_1_POSITION = -1
@@ -48,6 +103,7 @@ class DoubleBattle(AbstractBattle):
         # Battle state attributes
         self._active_pokemon: Dict[str, Pokemon] = {}
         self._opponent_active_pokemon: Dict[str, Pokemon] = {}
+        self._identifier_to_position: Optional[Dict[str, int]] = None
 
         # Other
         self._move_to_pokemon_id: Dict[Move, str] = {}
@@ -320,14 +376,10 @@ class DoubleBattle(AbstractBattle):
             return [self.EMPTY_TARGET_POSITION]
 
         pokemon_1, pokemon_2 = self.active_pokemon
-        if pokemon == pokemon_1 and move.id in [m.id for m in self.available_moves[0]]:
-            self_position = self.POKEMON_1_POSITION
-            ally_position = self.POKEMON_2_POSITION
-        elif pokemon == pokemon_2 and move.id in [
-            m.id for m in self.available_moves[1]
-        ]:
-            self_position = self.POKEMON_2_POSITION
-            ally_position = self.POKEMON_1_POSITION
+        if pokemon is pokemon_1:
+            slot_idx = 0
+        elif pokemon is pokemon_2:
+            slot_idx = 1
         else:
             raise Exception(
                 f"Selected move {move.id} is not owned by any active ally Pokemon "
@@ -353,57 +405,20 @@ class DoubleBattle(AbstractBattle):
         ):
             targets = [self.EMPTY_TARGET_POSITION]
         else:
-            targets = {
-                Target.from_showdown_message("adjacentAlly"): [ally_position],
-                Target.from_showdown_message("adjacentAllyOrSelf"): [
-                    ally_position,
-                    self_position,
-                ],
-                Target.from_showdown_message("adjacentFoe"): [
-                    self.OPPONENT_1_POSITION,
-                    self.OPPONENT_2_POSITION,
-                ],
-                Target.from_showdown_message("all"): [self.EMPTY_TARGET_POSITION],
-                Target.from_showdown_message("allAdjacent"): [
-                    self.EMPTY_TARGET_POSITION
-                ],
-                Target.from_showdown_message("allAdjacentFoes"): [
-                    self.EMPTY_TARGET_POSITION
-                ],
-                Target.from_showdown_message("allies"): [self.EMPTY_TARGET_POSITION],
-                Target.from_showdown_message("allySide"): [self.EMPTY_TARGET_POSITION],
-                Target.from_showdown_message("allyTeam"): [self.EMPTY_TARGET_POSITION],
-                Target.from_showdown_message("any"): [
-                    ally_position,
-                    self.OPPONENT_1_POSITION,
-                    self.OPPONENT_2_POSITION,
-                ],
-                Target.from_showdown_message("foeSide"): [self.EMPTY_TARGET_POSITION],
-                Target.from_showdown_message("normal"): [
-                    ally_position,
-                    self.OPPONENT_1_POSITION,
-                    self.OPPONENT_2_POSITION,
-                ],
-                Target.from_showdown_message("randomNormal"): [
-                    self.EMPTY_TARGET_POSITION
-                ],
-                Target.from_showdown_message("scripted"): [self.EMPTY_TARGET_POSITION],
-                Target.from_showdown_message("self"): [self.EMPTY_TARGET_POSITION],
-                self.EMPTY_TARGET_POSITION: [self.EMPTY_TARGET_POSITION],
-                None: [self.OPPONENT_1_POSITION, self.OPPONENT_2_POSITION],
-            }[move.deduced_target]
+            targets = _TARGET_POSITIONS[slot_idx][move.deduced_target]
+
+        if self._identifier_to_position is None:
+            self._identifier_to_position = {
+                f"{self.player_role}a": self.POKEMON_1_POSITION,
+                f"{self.player_role}b": self.POKEMON_2_POSITION,
+                f"{self.opponent_role}a": self.OPPONENT_1_POSITION,
+                f"{self.opponent_role}b": self.OPPONENT_2_POSITION,
+            }
 
         pokemon_ids = set(self._opponent_active_pokemon.keys())
         pokemon_ids.update(self._active_pokemon.keys())
-        targets_to_keep = {
-            {
-                f"{self.player_role}a": -1,
-                f"{self.player_role}b": -2,
-                f"{self.opponent_role}a": 1,
-                f"{self.opponent_role}b": 2,
-            }[pokemon_identifier]
-            for pokemon_identifier in pokemon_ids
-        }
+        id2pos = self._identifier_to_position
+        targets_to_keep = {id2pos[pid] for pid in pokemon_ids}
         targets_to_keep.add(self.EMPTY_TARGET_POSITION)
         targets = [target for target in targets if target in targets_to_keep]
 
