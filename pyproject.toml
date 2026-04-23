@@ -87,3 +87,6 @@ pythonVersion = "3.10"
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["unit_tests"]
+
+[tool.setuptools.package-data]
+poke_env = ["ps_client/*.js"]

@@ -13,6 +13,7 @@ from poke_env.player import (
 )
 from poke_env.ps_client import AccountConfiguration
 from poke_env.ps_client.server_configuration import (
+    LocalBattleStreamConfiguration,
     LocalhostServerConfiguration,
     ServerConfiguration,
     ShowdownServerConfiguration,
@@ -28,6 +29,7 @@ logging.addLevelName(25, "PS_ERROR")
 
 __all__ = [
     "AccountConfiguration",
+    "LocalBattleStreamConfiguration",
     "LocalhostServerConfiguration",
     "MaxBasePowerPlayer",
     "Player",

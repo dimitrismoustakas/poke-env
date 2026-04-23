@@ -32,6 +32,7 @@ from poke_env.player.battle_order import (
 from poke_env.player.player import Player
 from poke_env.ps_client import AccountConfiguration
 from poke_env.ps_client.server_configuration import (
+    LocalBattleStreamConfiguration,
     LocalhostServerConfiguration,
     ServerConfiguration,
 )
@@ -169,7 +170,7 @@ class PokeEnv(ParallelEnv[str, Dict[str, Any], ActionType]):
         log_level: Optional[int] = None,
         save_replays: Union[bool, str] = False,
         server_configuration: Optional[
-            ServerConfiguration
+            Union[ServerConfiguration, LocalBattleStreamConfiguration]
         ] = LocalhostServerConfiguration,
         accept_open_team_sheet: Optional[bool] = False,
         start_timer_on_battle_start: bool = False,
@@ -200,9 +201,10 @@ class PokeEnv(ParallelEnv[str, Dict[str, Any], ActionType]):
             True will lead to replays being saved in a potentially new /replay folder,
             or a string representing a folder where replays will be saved.
         :type save_replays: bool or str
-        :param server_configuration: Server configuration. Defaults to Localhost Server
-            Configuration.
-        :type server_configuration: ServerConfiguration, optional
+        :param server_configuration: Server configuration. Use ServerConfiguration for
+            websocket-backed battles or LocalBattleStreamConfiguration for direct local
+            simulation. Defaults to Localhost Server Configuration.
+        :type server_configuration: ServerConfiguration or LocalBattleStreamConfiguration, optional
         :param start_listening: Whether to start listening to the server. Defaults to
             True.
         :type start_listening: bool

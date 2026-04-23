@@ -33,7 +33,9 @@ from poke_env.player.battle_order import (
 )
 from poke_env.ps_client import PSClient
 from poke_env.ps_client.account_configuration import AccountConfiguration
+from poke_env.ps_client.local_client import LocalBattleStreamClient, run_local_battles
 from poke_env.ps_client.server_configuration import (
+    LocalBattleStreamConfiguration,
     LocalhostServerConfiguration,
     ServerConfiguration,
 )
@@ -62,7 +64,9 @@ class Player(ABC):
         max_concurrent_battles: int = 1,
         accept_open_team_sheet: bool = False,
         save_replays: Union[bool, str] = False,
-        server_configuration: ServerConfiguration = LocalhostServerConfiguration,
+        server_configuration: Union[
+            ServerConfiguration, LocalBattleStreamConfiguration
+        ] = LocalhostServerConfiguration,
         start_timer_on_battle_start: bool = False,
         start_listening: bool = True,
         open_timeout: Optional[float] = 10.0,
@@ -94,9 +98,10 @@ class Player(ABC):
             True will lead to replays being saved in a potentially new /replay folder,
             or a string representing a folder where replays will be saved.
         :type save_replays: bool or str
-        :param server_configuration: Server configuration. Defaults to Localhost Server
-            Configuration.
-        :type server_configuration: ServerConfiguration
+        :param server_configuration: Server configuration. Use ServerConfiguration for
+            websocket-backed battles or LocalBattleStreamConfiguration for direct local
+            simulation. Defaults to Localhost Server Configuration.
+        :type server_configuration: ServerConfiguration or LocalBattleStreamConfiguration
         :param start_listening: Whether to start listening to the server. Defaults to
             True.
         :type start_listening: bool
@@ -147,21 +152,38 @@ class Player(ABC):
         elif isinstance(team, str):
             self._team = ConstantTeambuilder(team)
 
-        self.ps_client = PSClient(
-            account_configuration=account_configuration
-            or AccountConfiguration.generate(self.__class__.__name__),
-            avatar=avatar,
-            log_level=log_level,
-            on_battle_message=self._handle_battle_message,
-            on_update_challenges=self._update_challenges,
-            on_challenge_request=self._handle_challenge_request,
-            server_configuration=server_configuration,
-            start_listening=start_listening,
-            open_timeout=open_timeout,
-            ping_interval=ping_interval,
-            ping_timeout=ping_timeout,
-            loop=loop,
+        account_configuration = account_configuration or AccountConfiguration.generate(
+            self.__class__.__name__
         )
+
+        self.ps_client: PSClient
+
+        if isinstance(server_configuration, LocalBattleStreamConfiguration):
+            self.ps_client = LocalBattleStreamClient(
+                account_configuration=account_configuration,
+                avatar=avatar,
+                log_level=log_level,
+                on_battle_message=self._handle_battle_message,
+                on_update_challenges=self._update_challenges,
+                on_challenge_request=self._handle_challenge_request,
+                server_configuration=server_configuration,
+                loop=loop,
+            )
+        else:
+            self.ps_client = PSClient(
+                account_configuration=account_configuration,
+                avatar=avatar,
+                log_level=log_level,
+                on_battle_message=self._handle_battle_message,
+                on_update_challenges=self._update_challenges,
+                on_challenge_request=self._handle_challenge_request,
+                server_configuration=server_configuration,
+                start_listening=start_listening,
+                open_timeout=open_timeout,
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
+                loop=loop,
+            )
 
         self.logger.debug("Player initialisation finished")
 
@@ -544,6 +566,17 @@ class Player(ABC):
 
     async def _battle_against(self, *opponents: Player, n_battles: int):
         for opponent in opponents:
+            local_self = isinstance(self.ps_client, LocalBattleStreamClient)
+            local_opponent = isinstance(opponent.ps_client, LocalBattleStreamClient)
+
+            if local_self or local_opponent:
+                if not (local_self and local_opponent):
+                    raise ShowdownException(
+                        "Cannot battle local and websocket-backed players against each other"
+                    )
+                await run_local_battles(self, opponent, n_battles)
+                continue
+
             await asyncio.gather(
                 self.send_challenges(
                     to_id_str(opponent.username),

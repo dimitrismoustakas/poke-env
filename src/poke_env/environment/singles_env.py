@@ -16,6 +16,7 @@ from poke_env.player.battle_order import (
 from poke_env.player.player import Player
 from poke_env.ps_client import (
     AccountConfiguration,
+    LocalBattleStreamConfiguration,
     LocalhostServerConfiguration,
     ServerConfiguration,
 )
@@ -33,7 +34,7 @@ class SinglesEnv(PokeEnv[np.int64]):
         log_level: Optional[int] = None,
         save_replays: Union[bool, str] = False,
         server_configuration: Optional[
-            ServerConfiguration
+            Union[ServerConfiguration, LocalBattleStreamConfiguration]
         ] = LocalhostServerConfiguration,
         accept_open_team_sheet: Optional[bool] = False,
         start_timer_on_battle_start: bool = False,
