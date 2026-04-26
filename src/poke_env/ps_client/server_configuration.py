@@ -19,15 +19,19 @@ class LocalBattleStreamConfiguration:
 
     showdown_dir: str | Path
     worker_count: int = 1
+    max_battles_per_worker: int = 1
     startup_timeout: float = 10.0
     event_timeout: float = 30.0
     protocol: str = "jsonl"
     stderr_tail_lines: int = 100
     node_command: Sequence[str] | None = None
     pool_mode: str = "single"
+    runtime_loop_count: int = 0
 
     def __post_init__(self):
         object.__setattr__(self, "showdown_dir", Path(self.showdown_dir))
+        if self.node_command is not None:
+            object.__setattr__(self, "node_command", tuple(self.node_command))
 
 
 LocalhostServerConfiguration = ServerConfiguration(
