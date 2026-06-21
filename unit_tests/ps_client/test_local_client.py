@@ -7,11 +7,14 @@ from poke_env import AccountConfiguration, LocalBattleStreamConfiguration
 from poke_env.concurrency import POKE_LOOP
 from poke_env.exceptions import ShowdownException
 from poke_env.ps_client.local_client import (
+    _AsyncPayloadMailbox,
     LocalBattleStreamClient,
     LocalBattleStreamSession,
     _CrossLoopLocalBattleController,
     _LOCAL_CLIENT_REFCOUNTS,
     _LOCAL_WORKER_POOLS,
+    _SharedBattleState,
+    _SharedLocalBattleStreamWorker,
     _expand_worker_events,
     _get_or_create_worker_pool,
     _protocol_batch_payload,
@@ -105,6 +108,31 @@ def test_protocol_batch_payload_flattens_nested_worker_batches():
             {"type": "side-chunk", "player": "p1", "messages": []},
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_global_error_event_is_terminal_without_unpack_error():
+    worker = _SharedLocalBattleStreamWorker(
+        LocalBattleStreamConfiguration("C:/showdown"),
+        worker_index=0,
+    )
+    state = _SharedBattleState(
+        message_queue=_AsyncPayloadMailbox(),
+        battle_done=asyncio.Event(),
+    )
+    worker._battle_states["battle-1"] = state
+
+    result = await worker._handle_stdout_events(
+        [{"type": "error", "detail": "worker failed"}]
+    )
+
+    assert result is False
+    assert worker._fatal_error is not None
+    assert state.active is False
+    assert state.battle_done.is_set()
+    payload = await state.message_queue.get(timeout=0.0)
+    assert isinstance(payload, ShowdownException)
+    assert "worker failed" in str(payload)
 
 
 @pytest.mark.parametrize(

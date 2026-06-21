@@ -11,6 +11,7 @@ from poke_env.battle.target import Target
 from poke_env.player.battle_order import (
     DefaultBattleOrder,
     PassBattleOrder,
+    SkippedBattleOrder,
     SingleBattleOrder,
 )
 
@@ -633,7 +634,13 @@ class DoubleBattle(AbstractBattle):
                         )
                     ]
             if not orders[i]:
-                orders[i] += [PassBattleOrder()]
+                active_mon = self.active_pokemon[i]
+                if not self.force_switch[i] and (
+                    active_mon is None or Effect.COMMANDER in active_mon.effects
+                ):
+                    orders[i] += [SkippedBattleOrder()]
+                else:
+                    orders[i] += [PassBattleOrder()]
         return orders
 
     @property

@@ -839,7 +839,7 @@ class _SharedLocalBattleStreamWorker:
                 self._fatal_error = error
                 await self._broadcast_worker_error(error)
                 self._ready.set()
-                return True
+                return False
 
             state = self._battle_states.get(str(battle_id))
             if state is not None:

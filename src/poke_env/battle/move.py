@@ -255,8 +255,6 @@ class Move:
             return self.target
         elif self.request_target:
             return self.request_target
-        elif self.target == "randomNormal":
-            return self.request_target
         return self.target
 
     @property

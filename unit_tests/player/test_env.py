@@ -28,6 +28,7 @@ from poke_env.player import (
     DoubleBattleOrder,
     ForfeitBattleOrder,
     Player,
+    SkippedBattleOrder,
     SingleBattleOrder,
 )
 from poke_env.ps_client import AccountConfiguration, ServerConfiguration
@@ -536,10 +537,14 @@ def test_doubles_action_order_conversions():
 
         assert (
             p.action_to_order(np.array([10, 0]), battle).message
-            == "/choose move flamethrower 1, pass"
+            == "/choose move flamethrower 1"
         )
         check_action_order_roundtrip(
-            p, DoubleBattleOrder(Player.create_order(move, move_target=1)), battle
+            p,
+            DoubleBattleOrder(
+                Player.create_order(move, move_target=1), SkippedBattleOrder()
+            ),
+            battle,
         )
         battle._available_switches = [[active_pokemon], []]
 
@@ -551,12 +556,12 @@ def test_doubles_action_order_conversions():
 
         assert (
             p.action_to_order(np.array([1, -2]), battle).message
-            == "/choose switch Charizard, default"
+            == "/choose switch Charizard"
         )
         check_action_order_roundtrip(
             p,
             DoubleBattleOrder(
-                Player.create_order(active_pokemon), DefaultBattleOrder()
+                Player.create_order(active_pokemon), SkippedBattleOrder()
             ),
             battle,
         )
@@ -599,23 +604,27 @@ def test_doubles_action_order_conversions():
             battle._can_mega_evolve = [True, True]
             assert (
                 p.action_to_order(np.array([30, 0]), battle).message
-                == "/choose move flamethrower mega 1, pass"
+                == "/choose move flamethrower mega 1"
             )
             check_action_order_roundtrip(
                 p,
-                DoubleBattleOrder(Player.create_order(move, mega=True, move_target=1)),
+                DoubleBattleOrder(
+                    Player.create_order(move, mega=True, move_target=1),
+                    SkippedBattleOrder(),
+                ),
                 battle,
             )
         if has_z_moves:
             battle._can_z_move = [True, True]
             assert (
                 p.action_to_order(np.array([50, 0]), battle).message
-                == "/choose move flamethrower zmove 1, pass"
+                == "/choose move flamethrower zmove 1"
             )
             check_action_order_roundtrip(
                 p,
                 DoubleBattleOrder(
-                    Player.create_order(move, z_move=True, move_target=1)
+                    Player.create_order(move, z_move=True, move_target=1),
+                    SkippedBattleOrder(),
                 ),
                 battle,
             )
@@ -623,12 +632,13 @@ def test_doubles_action_order_conversions():
             battle._can_dynamax = [True, True]
             assert (
                 p.action_to_order(np.array([70, 0]), battle).message
-                == "/choose move flamethrower dynamax 1, pass"
+                == "/choose move flamethrower dynamax 1"
             )
             check_action_order_roundtrip(
                 p,
                 DoubleBattleOrder(
-                    Player.create_order(move, dynamax=True, move_target=1)
+                    Player.create_order(move, dynamax=True, move_target=1),
+                    SkippedBattleOrder(),
                 ),
                 battle,
             )
@@ -636,12 +646,13 @@ def test_doubles_action_order_conversions():
             battle._can_tera = [True, True]
             assert (
                 p.action_to_order(np.array([90, 0]), battle).message
-                == "/choose move flamethrower terastallize 1, pass"
+                == "/choose move flamethrower terastallize 1"
             )
             check_action_order_roundtrip(
                 p,
                 DoubleBattleOrder(
-                    Player.create_order(move, terastallize=True, move_target=1)
+                    Player.create_order(move, terastallize=True, move_target=1),
+                    SkippedBattleOrder(),
                 ),
                 battle,
             )

@@ -16,6 +16,7 @@ from poke_env.player.battle_order import (
     DefaultBattleOrder,
     DoubleBattleOrder,
     PassBattleOrder,
+    SkippedBattleOrder,
     SingleBattleOrder,
 )
 from poke_env.player.player import Player
@@ -64,7 +65,7 @@ class MaxBasePowerPlayer(Player):
             switches = [s for s in switches if s != switched_in]
 
             if not mon or mon.fainted:
-                orders.append(PassBattleOrder())
+                orders.append(SkippedBattleOrder())
                 continue
             elif not moves and switches:
                 mon_to_switch_in = random.choice(switches)
@@ -394,10 +395,10 @@ class SimpleHeuristicsPlayer(Player):
         for active_id in [0, 1]:
             mon = battle.active_pokemon[active_id]
             if mon is not None and Effect.COMMANDER in mon.effects:
-                orders += [PassBattleOrder()]
+                orders += [SkippedBattleOrder()]
                 continue
             if mon is None and not battle.available_switches[active_id]:
-                orders += [PassBattleOrder()]
+                orders += [SkippedBattleOrder()]
                 continue
             results = [
                 self.choose_singles_move(PseudoBattle(battle, active_id, opp_id))

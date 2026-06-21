@@ -4,6 +4,7 @@ from poke_env.player import (
     DoubleBattleOrder,
     ForfeitBattleOrder,
     PassBattleOrder,
+    SkippedBattleOrder,
     SingleBattleOrder,
 )
 
@@ -47,9 +48,17 @@ def test_pass_order():
     assert so == po
 
 
+def test_skipped_order():
+    skipped = SkippedBattleOrder()
+
+    assert isinstance(skipped, BattleOrder)
+    assert skipped.message == ""
+
+
 def test_double_orders():
     move = SingleBattleOrder(Move("selfdestruct", gen=8), move_target=2)
     mon = SingleBattleOrder(Pokemon(species="lugia", gen=8))
+    skipped = SkippedBattleOrder()
 
     assert (
         DoubleBattleOrder(move, mon).message
@@ -65,6 +74,9 @@ def test_double_orders():
         == "/choose pass, move selfdestruct 2"
     )
     assert DoubleBattleOrder().message == "/choose pass, pass"
+    assert DoubleBattleOrder(skipped, move).message == "/choose move selfdestruct 2"
+    assert DoubleBattleOrder(move, skipped).message == "/choose move selfdestruct 2"
+    assert DoubleBattleOrder(skipped, skipped).message == "/choose default"
 
     orders = [move, mon]
 

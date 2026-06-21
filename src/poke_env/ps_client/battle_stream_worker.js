@@ -223,7 +223,12 @@ function startBattle(battleId, lines) {
 function writeBattleLines(battleId, lines) {
     const stream = activeStreams.get(battleId);
     if (!stream) {
-        throw new Error(`Received a write command without an active battle: ${battleId}`);
+        queueEvent({
+            type: 'error',
+            battleId,
+            detail: formatError(new Error(`Received a write command without an active battle: ${battleId}`)),
+        });
+        return;
     }
 
     validateLines(lines, 'write');

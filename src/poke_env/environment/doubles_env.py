@@ -15,6 +15,7 @@ from poke_env.player.battle_order import (
     DoubleBattleOrder,
     ForfeitBattleOrder,
     PassBattleOrder,
+    SkippedBattleOrder,
     SingleBattleOrder,
 )
 from poke_env.player.player import Player
@@ -184,9 +185,21 @@ class DoublesEnv(PokeEnv[npt.NDArray[np.int64]]):
         action: np.int64, battle: DoubleBattle, fake: bool, pos: int
     ) -> SingleBattleOrder:
         if action == -2:
-            return DefaultBattleOrder()
+            valid_skipped_orders = [
+                order
+                for order in battle.valid_orders[pos]
+                if isinstance(order, SkippedBattleOrder)
+            ]
+            return valid_skipped_orders[0] if valid_skipped_orders else DefaultBattleOrder()
         elif action == 0:
-            order: SingleBattleOrder = PassBattleOrder()
+            valid_pass_orders = [
+                order
+                for order in battle.valid_orders[pos]
+                if isinstance(order, (PassBattleOrder, SkippedBattleOrder))
+            ]
+            order: SingleBattleOrder = (
+                valid_pass_orders[0] if valid_pass_orders else PassBattleOrder()
+            )
         elif action < 7:
             order = Player.create_order(list(battle.team.values())[action - 1])
         else:
@@ -321,10 +334,16 @@ class DoublesEnv(PokeEnv[npt.NDArray[np.int64]]):
         order: SingleBattleOrder, battle: DoubleBattle, fake: bool, pos: int
     ) -> np.int64:
         if isinstance(order.order, str):
+            if not fake and str(order) not in [str(o) for o in battle.valid_orders[pos]]:
+                raise ValueError(
+                    f"Invalid order from player {battle.player_username} in battle "
+                    f"{battle.battle_tag} at position {pos} - order {order} not in "
+                    f"action space {[str(o) for o in battle.valid_orders[pos]]}!"
+                )
             if isinstance(order, DefaultBattleOrder):
                 return np.int64(-2)
             else:
-                assert isinstance(order, PassBattleOrder)
+                assert isinstance(order, (PassBattleOrder, SkippedBattleOrder))
                 return np.int64(0)
         if not fake and str(order) not in [str(o) for o in battle.valid_orders[pos]]:
             raise ValueError(

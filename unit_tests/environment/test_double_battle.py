@@ -162,6 +162,7 @@ def test_get_possible_showdown_targets(example_doubles_request):
     battle.switch("p2a: Milotic", "Milotic, L50, F", "48/48")
     assert battle.get_possible_showdown_targets(psychic, mr_rime) == [-2, 1, 2]
     assert battle.get_possible_showdown_targets(slackoff, mr_rime) == [0]
+    assert battle.get_possible_showdown_targets(Move("outrage", gen=8), mr_rime) == [0]
     assert battle.get_possible_showdown_targets(psychic, mr_rime, dynamax=True) == [
         1,
         2,

@@ -72,6 +72,11 @@ class PassBattleOrder(SingleBattleOrder):
         super().__init__("/choose pass")
 
 
+class SkippedBattleOrder(SingleBattleOrder):
+    def __init__(self):
+        super().__init__("")
+
+
 @dataclass
 class DoubleBattleOrder(BattleOrder):
     first_order: SingleBattleOrder = field(default_factory=PassBattleOrder)
@@ -79,7 +84,15 @@ class DoubleBattleOrder(BattleOrder):
 
     @property
     def message(self) -> str:
-        return f"{self.first_order.message}, {self.second_order.message[8:]}"
+        choices = []
+        for order in (self.first_order, self.second_order):
+            if isinstance(order, SkippedBattleOrder):
+                continue
+            message = order.message
+            choices.append(message[8:] if message.startswith("/choose ") else message)
+        if not choices:
+            return "/choose default"
+        return "/choose " + ", ".join(choices)
 
     @staticmethod
     def join_orders(

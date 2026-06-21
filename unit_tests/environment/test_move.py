@@ -531,6 +531,16 @@ def test_target():
         assert isinstance(move.target, Target)
 
 
+def test_random_normal_deduced_target_remains_non_choosable():
+    outrage = Move("outrage", gen=9)
+
+    assert outrage.target == Target.RANDOM_NORMAL
+    assert outrage.deduced_target == Target.RANDOM_NORMAL
+
+    outrage.request_target = "randomNormal"
+    assert outrage.deduced_target == Target.RANDOM_NORMAL
+
+
 def test_terrain():
     flame_thrower = Move("flamethrower", gen=8)
     electric_terrain = Move("electricterrain", gen=8)
