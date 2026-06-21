@@ -462,6 +462,7 @@ async def test_local_session_dispatches_pre_split_worker_payloads():
     )
 
     assert finished is False
+    await session._wait_for_dispatches()
     assert session._client_1.messages == [("battle-test", "|turn|1\n|request|p1")]
     assert session._client_2.messages == [("battle-test", "|turn|1\n|request|p2")]
 
@@ -494,6 +495,63 @@ async def test_local_session_dispatches_player_updates_concurrently():
     finished = await session._dispatch_protocol_message("update\n|turn|1")
 
     assert finished is False
+    await session._wait_for_dispatches()
+
+
+@pytest.mark.asyncio
+async def test_local_session_single_side_request_does_not_block_other_side():
+    p2_release = asyncio.Event()
+    p1_received = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self, player: str):
+            self.player = player
+            self.messages = []
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            self.messages.append((room, payload))
+            if self.player == "p2":
+                await p2_release.wait()
+            else:
+                p1_received.set()
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = BlockingClient("p1")
+    session._client_2 = BlockingClient("p2")
+    session._accepting_player_messages = True
+
+    assert (
+        await session._dispatch_protocol_message(
+            {
+                "type": "side-chunk",
+                "player": "p2",
+                "messages": [["", "request", "p2"]],
+            }
+        )
+        is False
+    )
+    assert (
+        await session._dispatch_protocol_message(
+            {
+                "type": "side-chunk",
+                "player": "p1",
+                "messages": [["", "request", "p1"]],
+            }
+        )
+        is False
+    )
+
+    await asyncio.wait_for(p1_received.wait(), timeout=0.2)
+    p2_release.set()
+    await session._wait_for_dispatches()
+
+    assert session._client_1.messages == [
+        ("battle-test", [["", "request", "p1"]])
+    ]
+    assert session._client_2.messages == [
+        ("battle-test", [["", "request", "p2"]])
+    ]
 
 
 @pytest.mark.asyncio
@@ -513,6 +571,7 @@ async def test_local_session_dispatches_worker_split_message_arrays():
     )
 
     assert finished is False
+    await session._wait_for_dispatches()
     assert session._client_1.messages == [
         ("battle-test", [["", "turn", "1"], ["", "request", "p1"]])
     ]
@@ -555,6 +614,7 @@ async def test_local_session_dispatches_protocol_batches_until_terminal():
 
     assert finished is True
     assert session._accepting_player_messages is False
+    await session._wait_for_dispatches()
     assert session._client_1.messages == [
         ("battle-test", [["", "turn", "1"], ["", "request", "p1"]])
     ]
@@ -584,6 +644,7 @@ async def test_local_session_treats_win_message_as_terminal_without_stream_end()
 
     assert finished is True
     assert session._accepting_player_messages is False
+    await session._wait_for_dispatches()
     assert session._client_1.messages == [
         ("battle-test", [["", "turn", "2"], ["", "win", "Player 1"]])
     ]
@@ -636,6 +697,7 @@ async def test_local_session_drains_terminal_protocol_batch_for_both_players():
 
     assert finished is True
     assert session._accepting_player_messages is False
+    await session._wait_for_dispatches()
     assert session._client_1.messages == [
         (
             "battle-test",
@@ -690,6 +752,7 @@ async def test_local_session_replays_global_terminal_result_to_missing_side():
 
     assert finished is True
     assert session._accepting_player_messages is False
+    await session._wait_for_dispatches()
     assert session._client_1.messages == [
         (
             "battle-test",

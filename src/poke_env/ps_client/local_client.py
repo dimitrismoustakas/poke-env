@@ -1920,10 +1920,14 @@ class LocalBattleStreamSession:
         self._accepting_player_messages: bool = True
         self._pool: _LocalBattleStreamWorkerPoolProtocol | None = None
         self._worker: _LocalBattleControllerProtocol | None = None
+        self._dispatch_tails: dict[LocalBattleStreamClient, asyncio.Task[None]] = {}
+        self._dispatch_tasks: set[asyncio.Task[None]] = set()
+        self._dispatch_failure: asyncio.Future[None] | None = None
 
     async def run(self) -> None:
         self._validate_configuration()
         self._attach_clients()
+        self._ensure_dispatch_state()
         try:
             packed_team_1 = self._player_1.get_next_team()
             packed_team_2 = self._player_2.get_next_team()
@@ -1965,7 +1969,7 @@ class LocalBattleStreamSession:
 
         while True:
             try:
-                message = await self._worker.read_protocol_message(timeout)
+                message = await self._read_protocol_message(timeout)
             except asyncio.TimeoutError as exc:
                 if self._battle_started:
                     raise
@@ -2102,10 +2106,10 @@ class LocalBattleStreamSession:
                 player_slot = str(message.get("player", ""))
                 payload = message.get("messages") or str(message.get("payload", ""))
                 if player_slot == "p1":
-                    await self._client_1.dispatch_room_message(self._room, payload)
+                    self._enqueue_dispatch_player_payload(self._client_1, payload)
                     return self._stop_after_terminal_payload(payload)
                 if player_slot == "p2":
-                    await self._client_2.dispatch_room_message(self._room, payload)
+                    self._enqueue_dispatch_player_payload(self._client_2, payload)
                     return self._stop_after_terminal_payload(payload)
                 self._raise_failure(f"Unexpected side-chunk target: {player_slot}")
             if event_type == "end":
@@ -2120,10 +2124,10 @@ class LocalBattleStreamSession:
         if kind == "sideupdate":
             player_slot, _, body = payload.partition("\n")
             if player_slot == "p1":
-                await self._client_1.dispatch_room_message(self._room, body)
+                self._enqueue_dispatch_player_payload(self._client_1, body)
                 return self._stop_after_terminal_payload(body)
             if player_slot == "p2":
-                await self._client_2.dispatch_room_message(self._room, body)
+                self._enqueue_dispatch_player_payload(self._client_2, body)
                 return self._stop_after_terminal_payload(body)
             self._raise_failure(f"Unexpected sideupdate target: {player_slot}")
         if kind == "end":
@@ -2151,17 +2155,19 @@ class LocalBattleStreamSession:
 
     async def _finalize_battle(self) -> None:
         self._accepting_player_messages = False
-        if self._battle_started:
-            deinit_lines = ["|deinit"]
-            await self._dispatch_player_payloads(deinit_lines, deinit_lines)
+        try:
+            if self._battle_started:
+                deinit_lines = ["|deinit"]
+                await self._dispatch_player_payloads(deinit_lines, deinit_lines)
+                await self._wait_for_dispatches()
+        finally:
+            if self._worker is not None:
+                await self._worker.close_battle()
+                if self._pool is not None:
+                    await self._pool.release(self._worker)
+                self._worker = None
 
-        if self._worker is not None:
-            await self._worker.close_battle()
-            if self._pool is not None:
-                await self._pool.release(self._worker)
-            self._worker = None
-
-        self._detach_clients()
+            self._detach_clients()
 
     def _attach_clients(self) -> None:
         self._client_1.attach_battle(self._room, self, "p1")
@@ -2178,13 +2184,10 @@ class LocalBattleStreamSession:
         *,
         terminal: bool | None = None,
     ) -> bool:
-        dispatches = []
         if p1_payload:
-            dispatches.append(self._dispatch_player_payload(self._client_1, p1_payload))
+            self._enqueue_dispatch_player_payload(self._client_1, p1_payload)
         if p2_payload:
-            dispatches.append(self._dispatch_player_payload(self._client_2, p2_payload))
-        if dispatches:
-            await asyncio.gather(*dispatches)
+            self._enqueue_dispatch_player_payload(self._client_2, p2_payload)
         if terminal is not None:
             if terminal:
                 self._accepting_player_messages = False
@@ -2219,6 +2222,82 @@ class LocalBattleStreamSession:
         ):
             return client._dispatch_split_room_messages(self._room, payload)
         return client.dispatch_room_message(self._room, payload)
+
+    async def _read_protocol_message(self, timeout: float | None) -> object | None:
+        assert self._worker is not None
+        self._ensure_dispatch_state()
+        assert self._dispatch_failure is not None
+        if self._dispatch_failure.done():
+            self._dispatch_failure.result()
+
+        read_task = asyncio.create_task(self._worker.read_protocol_message(timeout))
+        wait_tasks: set[asyncio.Future] = {read_task}
+        if not self._dispatch_failure.done():
+            wait_tasks.add(self._dispatch_failure)
+
+        done, pending = await asyncio.wait(
+            wait_tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        if self._dispatch_failure in done:
+            read_task.cancel()
+            await asyncio.gather(read_task, return_exceptions=True)
+            self._dispatch_failure.result()
+
+        if read_task in pending:
+            read_task.cancel()
+        return await read_task
+
+    def _enqueue_dispatch_player_payload(
+        self,
+        client: LocalBattleStreamClient,
+        payload: str | list[str] | list[list[str]],
+    ) -> asyncio.Task[None]:
+        self._ensure_dispatch_state()
+        previous = self._dispatch_tails.get(client)
+
+        async def run_after_previous() -> None:
+            if previous is not None:
+                await previous
+            await self._dispatch_player_payload(client, payload)
+
+        task = asyncio.create_task(run_after_previous())
+        self._dispatch_tails[client] = task
+        self._dispatch_tasks.add(task)
+
+        def task_done(done_task: asyncio.Task[None]) -> None:
+            self._dispatch_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                failure = self._dispatch_failure
+                if failure is not None and not failure.done():
+                    failure.set_exception(exc)
+
+        task.add_done_callback(task_done)
+        return task
+
+    async def _wait_for_dispatches(self) -> None:
+        self._ensure_dispatch_state()
+        pending = [task for task in self._dispatch_tasks if not task.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        failure = self._dispatch_failure
+        if failure is not None and failure.done():
+            failure.result()
+
+    def _ensure_dispatch_state(self) -> None:
+        if not hasattr(self, "_dispatch_tails"):
+            self._dispatch_tails = {}
+        if not hasattr(self, "_dispatch_tasks"):
+            self._dispatch_tasks = set()
+        if (
+            not hasattr(self, "_dispatch_failure")
+            or self._dispatch_failure is None
+            or self._dispatch_failure.get_loop() is not asyncio.get_running_loop()
+        ):
+            self._dispatch_failure = asyncio.get_running_loop().create_future()
 
     def _player_options(
         self, player: Player, packed_team: str | None
