@@ -4,6 +4,7 @@ const {execSync} = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const {Worker} = require('worker_threads');
 
 function formatError(error) {
     if (error && typeof error.stack === 'string') {
@@ -129,10 +130,6 @@ function validateLines(lines, commandType) {
     }
 }
 
-function splitProtocolMessages(lines) {
-    return lines.map(line => line.split('|'));
-}
-
 const showdownDir = process.argv[2];
 if (!showdownDir) {
     throw new Error('Expected showdown_dir as the first argument.');
@@ -140,67 +137,129 @@ if (!showdownDir) {
 
 ensureBuilt(showdownDir);
 
-const {BattleStream} = require(path.join(showdownDir, 'dist', 'sim', 'battle-stream.js'));
-const {extractChannelMessages} = require(path.join(showdownDir, 'dist', 'sim', 'battle.js'));
-
 const activeStreams = new Map();
+const idleBattleWorkers = [];
+const allBattleWorkers = new Set();
 let closing = false;
+let shutdownStarted = false;
 let commandQueue = Promise.resolve();
 
-async function consumeBattle(battleId, stream) {
-    try {
-        while (true) {
-            const chunk = await stream.read();
-            if (chunk === null) {
-                break;
-            }
-            const newlineIndex = chunk.indexOf('\n');
-            const chunkType = newlineIndex >= 0 ? chunk.slice(0, newlineIndex) : chunk;
-            const payload = newlineIndex >= 0 ? chunk.slice(newlineIndex + 1) : '';
+function battleWorkerPath() {
+    return path.join(__dirname, 'battle_stream_battle_worker.js');
+}
 
-            switch (chunkType) {
-            case 'update': {
-                const channelMessages = extractChannelMessages(payload, [1, 2]);
-                queueProtocolMessage(battleId, {
-                    type: 'split-chunk',
-                    p1_messages: splitProtocolMessages(channelMessages[1]),
-                    p2_messages: splitProtocolMessages(channelMessages[2]),
-                });
-                break;
-            }
-            case 'sideupdate': {
-                const sideBreak = payload.indexOf('\n');
-                const player = sideBreak >= 0 ? payload.slice(0, sideBreak) : payload;
-                const sidePayload = sideBreak >= 0 ? payload.slice(sideBreak + 1) : '';
-                queueProtocolMessage(battleId, {
-                    type: 'side-chunk',
-                    player,
-                    messages: sidePayload ? splitProtocolMessages(sidePayload.split('\n')) : [],
-                });
-                break;
-            }
-            case 'end':
-                queueProtocolMessage(battleId, {type: 'end', payload});
-                break;
-            case 'requesteddata':
-                break;
-            default:
-                queueProtocolMessage(battleId, chunk);
-                break;
-            }
-        }
-    } catch (error) {
-        queueEvent({type: 'error', battleId, detail: formatError(error)});
-    } finally {
-        if (activeStreams.get(battleId) === stream) {
-            activeStreams.delete(battleId);
-        }
-        queueEvent({type: 'battle-ended', battleId});
-        if (closing && activeStreams.size === 0) {
-            await flushEvents();
-            process.exit(0);
+function removeIdleBattleWorker(handle) {
+    const index = idleBattleWorkers.indexOf(handle);
+    if (index >= 0) {
+        idleBattleWorkers.splice(index, 1);
+    }
+}
+
+function createBattleWorker() {
+    const handle = {
+        worker: new Worker(battleWorkerPath(), {workerData: {showdownDir}}),
+        activeBattleId: null,
+        exited: false,
+    };
+    allBattleWorkers.add(handle);
+    handle.worker.on('message', event => handleBattleWorkerEvent(handle, event));
+    handle.worker.on('error', error => handleBattleWorkerError(handle, error));
+    handle.worker.on('exit', code => handleBattleWorkerExit(handle, code));
+    return handle;
+}
+
+function acquireBattleWorker() {
+    while (idleBattleWorkers.length > 0) {
+        const handle = idleBattleWorkers.pop();
+        if (!handle.exited) {
+            return handle;
         }
     }
+    return createBattleWorker();
+}
+
+function releaseBattleWorker(handle) {
+    if (!closing && !handle.exited) {
+        idleBattleWorkers.push(handle);
+    }
+}
+
+function handleBattleWorkerEvent(handle, event) {
+    if (!event || typeof event !== 'object') {
+        return;
+    }
+    if (event.type === 'ready') {
+        return;
+    }
+
+    const battleId = handle.activeBattleId;
+    if (!battleId) {
+        if (event.type === 'error') {
+            queueEvent({type: 'error', detail: event.detail || 'Idle battle worker failed'});
+        }
+        return;
+    }
+
+    if (event.type === 'battle-ended') {
+        if (activeStreams.get(battleId) === handle) {
+            activeStreams.delete(battleId);
+        }
+        handle.activeBattleId = null;
+        queueEvent({type: 'battle-ended', battleId});
+        releaseBattleWorker(handle);
+        if (closing && activeStreams.size === 0) {
+            void finishShutdown();
+        }
+        return;
+    }
+
+    queueEvent({...event, battleId});
+}
+
+function handleBattleWorkerError(handle, error) {
+    const battleId = handle.activeBattleId;
+    if (battleId && activeStreams.get(battleId) === handle) {
+        queueEvent({type: 'error', battleId, detail: formatError(error)});
+    } else {
+        queueEvent({type: 'error', detail: formatError(error)});
+    }
+}
+
+function handleBattleWorkerExit(handle, code) {
+    handle.exited = true;
+    allBattleWorkers.delete(handle);
+    removeIdleBattleWorker(handle);
+
+    const battleId = handle.activeBattleId;
+    handle.activeBattleId = null;
+    if (battleId && activeStreams.get(battleId) === handle) {
+        activeStreams.delete(battleId);
+        if (code !== 0) {
+            queueEvent({
+                type: 'error',
+                battleId,
+                detail: `Battle worker thread exited with code ${code}`,
+            });
+        }
+        queueEvent({type: 'battle-ended', battleId});
+    }
+    if (closing && activeStreams.size === 0) {
+        void finishShutdown();
+    }
+}
+
+async function finishShutdown() {
+    if (shutdownStarted) {
+        return;
+    }
+    shutdownStarted = true;
+    const terminations = [];
+    for (const handle of allBattleWorkers) {
+        terminations.push(handle.worker.terminate());
+    }
+    await Promise.allSettled(terminations);
+    await flushEvents();
+    process.exit(0);
 }
 
 function startBattle(battleId, lines) {
@@ -212,17 +271,15 @@ function startBattle(battleId, lines) {
     }
 
     validateLines(lines, 'start');
-    const stream = new BattleStream({noCatch: true});
-    activeStreams.set(battleId, stream);
-    void consumeBattle(battleId, stream);
-    for (const line of lines) {
-        stream.write(line);
-    }
+    const handle = acquireBattleWorker();
+    handle.activeBattleId = battleId;
+    activeStreams.set(battleId, handle);
+    handle.worker.postMessage({type: 'start', lines});
 }
 
 function writeBattleLines(battleId, lines) {
-    const stream = activeStreams.get(battleId);
-    if (!stream) {
+    const handle = activeStreams.get(battleId);
+    if (!handle) {
         queueEvent({
             type: 'error',
             battleId,
@@ -232,21 +289,15 @@ function writeBattleLines(battleId, lines) {
     }
 
     validateLines(lines, 'write');
-    for (const line of lines) {
-        stream.write(line);
-    }
+    handle.worker.postMessage({type: 'write', lines});
 }
 
 async function closeBattle(battleId) {
-    const stream = activeStreams.get(battleId);
-    if (stream) {
-        stream.destroy();
-        activeStreams.delete(battleId);
+    const handle = activeStreams.get(battleId);
+    if (handle) {
+        handle.worker.postMessage({type: 'close-battle'});
+    } else {
         queueEvent({type: 'battle-ended', battleId});
-        if (closing && activeStreams.size === 0) {
-            await flushEvents();
-            process.exit(0);
-        }
     }
 }
 
@@ -268,8 +319,7 @@ async function handleCommand(command) {
                 await closeBattle(battleId);
             }
         } else {
-            await flushEvents();
-            process.exit(0);
+            await finishShutdown();
         }
         break;
     default:
