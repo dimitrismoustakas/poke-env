@@ -405,6 +405,8 @@ class DoubleBattle(AbstractBattle):
             and pokemon.tera_type == PokemonType.STELLAR
         ):
             targets = [self.EMPTY_TARGET_POSITION]
+        elif move.request_index is not None and move.request_target is None:
+            targets = [self.EMPTY_TARGET_POSITION]
         else:
             targets = _TARGET_POSITIONS[slot_idx][move.deduced_target]
 

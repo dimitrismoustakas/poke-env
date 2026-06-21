@@ -806,24 +806,29 @@ class Pokemon:
         if Effect.COMMANDER in self.effects:
             return []
 
-        request_moves: List[str] = [
-            move["id"] for move in request["moves"] if not move.get("disabled", False)
-        ]
-        for move in request_moves:
-            if move in self.moves:
+        for move in self.moves.values():
+            move.clear_request_metadata()
+            if move._dynamaxed_move is not None:
+                move.dynamaxed.clear_request_metadata()
+
+        for request_index, move_request in enumerate(request["moves"], start=1):
+            if move_request.get("disabled", False):
+                continue
+            move_id = move_request["id"]
+            if move_id in self.moves:
                 if self.is_dynamaxed:
-                    moves.append(self.moves[move].dynamaxed)
+                    move = self.moves[move_id].dynamaxed
                 else:
-                    moves.append(self.moves[move])
-            elif move in SPECIAL_MOVES:
-                moves.append(Move(move, gen=self.gen))
+                    move = self.moves[move_id]
+            elif move_id in SPECIAL_MOVES:
+                move = Move(move_id, gen=self.gen)
             elif (
-                move == "hiddenpower"
+                move_id == "hiddenpower"
                 and len([m for m in self.moves if m.startswith("hiddenpower")]) == 1
             ):
-                moves.append(
-                    [v for m, v in self.moves.items() if m.startswith("hiddenpower")][0]
-                )
+                move = [v for m, v in self.moves.items() if m.startswith("hiddenpower")][
+                    0
+                ]
             else:
                 assert self.ability == "dancer" or {
                     "copycat",
@@ -832,11 +837,19 @@ class Pokemon:
                     "mirrormove",
                     "assist",
                 }.intersection(self.moves), (
-                    f"Error with move {move}. Expected self.moves to contain copycat, "
+                    f"Error with move {move_id}. Expected self.moves to contain copycat, "
                     "metronome, mefirst, mirrormove, or assist, or to have the ability "
                     f"dancer. Got {self.moves}, ability: {self.ability}"
                 )
-                moves.append(Move(move, gen=self.gen))
+                move = Move(move_id, gen=self.gen)
+
+            move.clear_request_metadata()
+            request_target = move_request.get("target")
+            if request_target is None:
+                move.request_index = request_index
+            else:
+                move.request_target = request_target
+            moves.append(move)
         return moves
 
     def damage_multiplier(self, type_or_move: Union[PokemonType, Move]) -> float:

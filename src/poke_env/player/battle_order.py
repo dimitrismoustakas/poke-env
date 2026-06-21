@@ -45,10 +45,14 @@ class SingleBattleOrder(BattleOrder):
     @property
     def message(self) -> str:
         if isinstance(self.order, Move):
-            if self.order.id == "recharge":
-                return "/choose move 1"
+            move_choice = self.order.request_index
+            if move_choice is None:
+                if self.order.id == "recharge":
+                    move_choice = 1
+                else:
+                    move_choice = self.order.id
 
-            message = f"/choose move {self.order.id}"
+            message = f"/choose move {move_choice}"
             if self.mega:
                 message += " mega"
             elif self.z_move:

@@ -1,3 +1,4 @@
+import copy
 import pickle
 from unittest.mock import MagicMock
 
@@ -175,6 +176,25 @@ def test_get_possible_showdown_targets(example_doubles_request):
     assert battle.get_possible_showdown_targets(terastarstorm, mr_rime) == [-2, 1, 2]
     mr_rime.terastallize("stellar")
     assert battle.get_possible_showdown_targets(terastarstorm, mr_rime) == [0]
+
+
+def test_targetless_request_index_suppresses_static_move_targets(
+    example_doubles_request,
+):
+    request = copy.deepcopy(example_doubles_request)
+    request["active"][0]["moves"] = [{"id": "psychic"}]
+    logger = MagicMock()
+    battle = DoubleBattle("tag", "username", logger, gen=8)
+
+    battle.parse_request(request)
+    mr_rime = battle.active_pokemon[0]
+    move = battle.available_moves[0][0]
+
+    assert move.id == "psychic"
+    assert move.request_index == 1
+    assert move.request_target is None
+    assert battle.get_possible_showdown_targets(move, mr_rime) == [0]
+    assert "/choose move 1" in {order.message for order in battle.valid_orders[0]}
 
 
 def test_to_showdown_target(example_doubles_request):

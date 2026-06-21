@@ -84,6 +84,7 @@ class Move:
         "_from_transform",
         "_gen",
         "_is_last_used",
+        "_request_index",
         "_request_target",
     )
 
@@ -115,6 +116,7 @@ class Move:
         self._is_last_used: bool = False
 
         self._dynamaxed_move = None
+        self._request_index: Optional[int] = None
         self._request_target = None
 
     def __repr__(self) -> str:
@@ -545,6 +547,21 @@ class Move:
         """
         return self._request_target
 
+    @property
+    def request_index(self) -> Optional[int]:
+        """
+        :return: One-based move index from the current request, if choosing this move
+            by slot is required to preserve Showdown's request semantics.
+        :rtype: Optional[int]
+        """
+        return self._request_index
+
+    @request_index.setter
+    def request_index(self, request_index: Optional[int]):
+        if request_index is not None and request_index < 1:
+            raise ValueError(f"Move request index must be positive: {request_index}")
+        self._request_index = request_index
+
     @request_target.setter
     def request_target(self, request_target: str):
         """
@@ -553,6 +570,10 @@ class Move:
         :type request_target: str
         """
         self._request_target = Target.from_showdown_message(request_target)
+
+    def clear_request_metadata(self):
+        self._request_index = None
+        self._request_target = None
 
     @staticmethod
     @lru_cache(maxsize=4096)

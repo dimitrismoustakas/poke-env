@@ -38,6 +38,10 @@ def test_single_orders():
         move, mega=True, move_target=2
     )
 
+    move.request_index = 3
+    assert SingleBattleOrder(move).message == "/choose move 3"
+    assert SingleBattleOrder(move, move_target=2).message == "/choose move 3 2"
+
 
 def test_pass_order():
     po = PassBattleOrder()

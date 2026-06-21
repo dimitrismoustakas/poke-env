@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock
 
-from poke_env.battle import DoubleBattle, Move, Pokemon, PokemonGender, PokemonType
+from poke_env.battle import DoubleBattle, Move, Pokemon, PokemonGender, PokemonType, Target
+from poke_env.player import SingleBattleOrder
 from poke_env.stats import _raw_hp, _raw_stat
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
@@ -213,6 +214,36 @@ def test_check_move_consistency_skips_early_gen_transform_maxpp():
     ditto.check_move_consistency(
         {"moves": [{"id": "bodyslam", "pp": 5, "maxpp": 15, "target": "normal"}]}
     )
+
+
+def test_available_moves_preserve_request_choice_metadata():
+    mon = Pokemon(species="dragonite", gen=9)
+    mon._add_move("outrage")
+    mon._add_move("extremespeed")
+
+    available = mon.available_moves_from_request(
+        {"moves": [{"id": "outrage", "target": "randomNormal"}]}
+    )
+    assert len(available) == 1
+    assert available[0] is mon.moves["outrage"]
+    assert available[0].request_index is None
+    assert available[0].request_target == Target.RANDOM_NORMAL
+    assert SingleBattleOrder(available[0]).message == "/choose move outrage"
+
+    available = mon.available_moves_from_request(
+        {
+            "moves": [
+                {"id": "outrage", "disabled": True},
+                {"id": "extremespeed"},
+            ]
+        }
+    )
+    assert len(available) == 1
+    assert available[0] is mon.moves["extremespeed"]
+    assert available[0].request_index == 2
+    assert available[0].request_target is None
+    assert mon.moves["outrage"].request_target is None
+    assert SingleBattleOrder(available[0]).message == "/choose move 2"
 
 
 def test_gen2_mimic_move_max_pp_respects_early_gen_cap():
