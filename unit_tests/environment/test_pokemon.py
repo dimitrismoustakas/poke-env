@@ -1,6 +1,14 @@
 from unittest.mock import MagicMock
 
-from poke_env.battle import DoubleBattle, Move, Pokemon, PokemonGender, PokemonType, Target
+from poke_env.battle import (
+    DoubleBattle,
+    Effect,
+    Move,
+    Pokemon,
+    PokemonGender,
+    PokemonType,
+    Target,
+)
 from poke_env.player import SingleBattleOrder
 from poke_env.stats import _raw_hp, _raw_stat
 from poke_env.teambuilder import TeambuilderPokemon
@@ -226,17 +234,12 @@ def test_available_moves_preserve_request_choice_metadata():
     )
     assert len(available) == 1
     assert available[0] is mon.moves["outrage"]
-    assert available[0].request_index is None
+    assert available[0].request_index == 1
     assert available[0].request_target == Target.RANDOM_NORMAL
-    assert SingleBattleOrder(available[0]).message == "/choose move outrage"
+    assert SingleBattleOrder(available[0]).message == "/choose move 1"
 
     available = mon.available_moves_from_request(
-        {
-            "moves": [
-                {"id": "outrage", "disabled": True},
-                {"id": "extremespeed"},
-            ]
-        }
+        {"moves": [{"id": "outrage", "disabled": True}, {"id": "extremespeed"}]}
     )
     assert len(available) == 1
     assert available[0] is mon.moves["extremespeed"]
@@ -244,6 +247,32 @@ def test_available_moves_preserve_request_choice_metadata():
     assert available[0].request_target is None
     assert mon.moves["outrage"].request_target is None
     assert SingleBattleOrder(available[0]).message == "/choose move 2"
+
+
+def test_request_clears_stale_commander_effect_before_available_moves():
+    mon = Pokemon(species="tatsugiri", gen=9)
+    mon._add_move("dracometeor")
+    mon.effects[Effect.COMMANDER] = 0
+    mon.update_from_request(
+        {
+            "ident": "p1: Tatsugiri",
+            "details": "Tatsugiri, L50, F",
+            "condition": "100/100",
+            "active": True,
+            "moves": ["dracometeor"],
+            "baseAbility": "commander",
+            "ability": "commander",
+            "item": "",
+            "commanding": False,
+        }
+    )
+
+    available = mon.available_moves_from_request(
+        {"moves": [{"id": "dracometeor", "target": "normal", "disabled": False}]}
+    )
+
+    assert Effect.COMMANDER not in mon.effects
+    assert available == [mon.moves["dracometeor"]]
 
 
 def test_gen2_mimic_move_max_pp_respects_early_gen_cap():

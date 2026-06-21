@@ -113,12 +113,10 @@ def test_protocol_batch_payload_flattens_nested_worker_batches():
 @pytest.mark.asyncio
 async def test_shared_worker_global_error_event_is_terminal_without_unpack_error():
     worker = _SharedLocalBattleStreamWorker(
-        LocalBattleStreamConfiguration("C:/showdown"),
-        worker_index=0,
+        LocalBattleStreamConfiguration("C:/showdown"), worker_index=0
     )
     state = _SharedBattleState(
-        message_queue=_AsyncPayloadMailbox(),
-        battle_done=asyncio.Event(),
+        message_queue=_AsyncPayloadMailbox(), battle_done=asyncio.Event()
     )
     worker._battle_states["battle-1"] = state
 
@@ -178,8 +176,7 @@ def test_get_or_create_worker_pool_is_thread_safe():
         with ThreadPoolExecutor(max_workers=16) as executor:
             pools = list(
                 executor.map(
-                    lambda _: _get_or_create_worker_pool(config, create_pool),
-                    range(64),
+                    lambda _: _get_or_create_worker_pool(config, create_pool), range(64)
                 )
             )
 
@@ -355,7 +352,11 @@ async def test_local_session_keeps_active_battles_idle_without_event_timeout():
         def __init__(self):
             self.timeouts: list[float | None] = []
             self.messages = [
-                {"type": "split-chunk", "p1_payload": "|turn|1", "p2_payload": "|turn|1"},
+                {
+                    "type": "split-chunk",
+                    "p1_payload": "|turn|1",
+                    "p2_payload": "|turn|1",
+                },
                 {"type": "end"},
             ]
 
@@ -391,6 +392,31 @@ async def test_local_session_keeps_active_battles_idle_without_event_timeout():
         {"type": "split-chunk", "p1_payload": "|turn|1", "p2_payload": "|turn|1"},
         {"type": "end"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_session_startup_timeout_reports_worker_diagnostics():
+    class TimeoutWorker:
+        async def read_protocol_message(self, timeout: float | None):
+            raise asyncio.TimeoutError
+
+        async def describe(self) -> str:
+            return "worker_index=7; battle_id=worker-7-battle-11"
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._config = LocalBattleStreamConfiguration("C:/showdown", startup_timeout=1.5)
+    session._room = "battle-test"
+    session._battle_started = False
+    session._worker = TimeoutWorker()
+
+    with pytest.raises(ShowdownException) as exc_info:
+        await session._consume_protocol_messages()
+
+    message = str(exc_info.value)
+    assert "Timed out waiting for initial local BattleStream output" in message
+    assert "battle-test" in message
+    assert "worker_index=7" in message
+    assert "battle_id=worker-7-battle-11" in message
 
 
 @pytest.mark.asyncio
@@ -516,7 +542,7 @@ async def test_local_session_dispatches_protocol_batches_until_terminal():
     assert finished is True
     assert session._accepting_player_messages is False
     assert session._client_1.messages == [
-        ("battle-test", [["", "turn", "1"], ["", "request", "p1"]]),
+        ("battle-test", [["", "turn", "1"], ["", "request", "p1"]])
     ]
     assert session._client_2.messages == [("battle-test", [["", "turn", "1"]])]
 

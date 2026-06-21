@@ -742,6 +742,12 @@ class Pokemon:
             for stat in request_pokemon["stats"]:
                 self._stats[stat] = request_pokemon["stats"][stat]
 
+        if "commanding" in request_pokemon:
+            if request_pokemon["commanding"]:
+                self.effects[Effect.COMMANDER] = 0
+            else:
+                self.effects.pop(Effect.COMMANDER, None)
+
     def _update_from_teambuilder(self, tb: TeambuilderPokemon):
         if tb.nickname is not None and tb.species is None:
             self._update_from_pokedex(tb.nickname)
@@ -826,9 +832,9 @@ class Pokemon:
                 move_id == "hiddenpower"
                 and len([m for m in self.moves if m.startswith("hiddenpower")]) == 1
             ):
-                move = [v for m, v in self.moves.items() if m.startswith("hiddenpower")][
-                    0
-                ]
+                move = [
+                    v for m, v in self.moves.items() if m.startswith("hiddenpower")
+                ][0]
             else:
                 assert self.ability == "dancer" or {
                     "copycat",
@@ -845,9 +851,8 @@ class Pokemon:
 
             move.clear_request_metadata()
             request_target = move_request.get("target")
-            if request_target is None:
-                move.request_index = request_index
-            else:
+            move.request_index = request_index
+            if request_target is not None:
                 move.request_target = request_target
             moves.append(move)
         return moves

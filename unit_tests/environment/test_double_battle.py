@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from poke_env.battle import DoubleBattle, Effect, Field, Move, Pokemon, PokemonType
-from poke_env.player.battle_order import PassBattleOrder
+from poke_env.player.battle_order import SkippedBattleOrder
 
 
 def test_battle_request_parsing(example_doubles_request):
@@ -580,7 +580,7 @@ def test_dondozo_tatsugiri():
                             "spd": 75,
                             "spe": 82,
                         },
-                        "moves": ["muddywater"],
+                        "moves": ["muddywater", "dracometeor"],
                         "baseAbility": "commander",
                         "item": "",
                         "pokeball": "pokeball",
@@ -622,16 +622,107 @@ def test_dondozo_tatsugiri():
     assert len(battle.available_moves[0]) == 1
     assert battle.available_switches[0] == []
 
-    # Tatsugiri slot (1) should have nothing (commanding)
+    # Request-side commanding state suppresses Tatsugiri's choices.
     assert battle.available_moves[1] == []
     assert battle.available_switches[1] == []
 
-    # valid_orders for commanding slot should be only pass
     assert len(battle.valid_orders[1]) == 1
-    assert isinstance(battle.valid_orders[1][0], PassBattleOrder)
+    assert isinstance(battle.valid_orders[1][0], SkippedBattleOrder)
 
     battle.parse_message(["", "faint", "p1a: Dondozo"])
     assert Effect.COMMANDER not in tatsu.effects
+
+
+def test_doubles_request_maps_active_entries_by_field_slot_not_team_order():
+    battle = DoubleBattle("tag", "username", MagicMock(), gen=9)
+    battle.player_role = "p1"
+    battle.parse_message(
+        ["", "switch", "p1a: Tatsugiri", "Tatsugiri-Droopy, L50, F", "100/100"]
+    )
+    battle.parse_message(["", "switch", "p1b: Dondozo", "Dondozo, L50, F", "100/100"])
+
+    battle.parse_request(
+        {
+            "active": [
+                {
+                    "moves": [
+                        {
+                            "move": "Protect",
+                            "id": "protect",
+                            "pp": 16,
+                            "maxpp": 16,
+                            "target": "self",
+                            "disabled": False,
+                        }
+                    ],
+                    "trapped": True,
+                },
+                {
+                    "moves": [
+                        {
+                            "move": "Protect",
+                            "id": "protect",
+                            "pp": 16,
+                            "maxpp": 16,
+                            "target": "self",
+                            "disabled": False,
+                        }
+                    ],
+                    "trapped": True,
+                },
+            ],
+            "side": {
+                "name": "username",
+                "id": "p1",
+                "pokemon": [
+                    {
+                        "ident": "p1: Dondozo",
+                        "details": "Dondozo, L50, F",
+                        "condition": "100/100",
+                        "active": True,
+                        "stats": {
+                            "atk": 150,
+                            "def": 135,
+                            "spa": 65,
+                            "spd": 85,
+                            "spe": 55,
+                        },
+                        "moves": ["protect"],
+                        "baseAbility": "unaware",
+                        "ability": "unaware",
+                        "item": "",
+                        "pokeball": "pokeball",
+                    },
+                    {
+                        "ident": "p1: Tatsugiri",
+                        "details": "Tatsugiri-Droopy, L50, F",
+                        "condition": "100/100",
+                        "active": True,
+                        "stats": {
+                            "atk": 40,
+                            "def": 62,
+                            "spa": 120,
+                            "spd": 75,
+                            "spe": 82,
+                        },
+                        "moves": ["protect"],
+                        "baseAbility": "commander",
+                        "ability": "commander",
+                        "item": "",
+                        "pokeball": "pokeball",
+                    },
+                ],
+            },
+            "rqid": 11,
+        }
+    )
+
+    assert [pokemon.species for pokemon in battle.active_pokemon] == [
+        "tatsugiridroopy",
+        "dondozo",
+    ]
+    assert [move.id for move in battle.available_moves[0]] == ["protect"]
+    assert [move.id for move in battle.available_moves[1]] == ["protect"]
 
 
 def test_dondozo_tatsugiri_switch_out():

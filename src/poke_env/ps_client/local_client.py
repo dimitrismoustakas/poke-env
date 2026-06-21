@@ -64,31 +64,37 @@ def _flatten_protocol_messages(messages: list[object]) -> list[object]:
 
 
 class _LocalBattleControllerProtocol(Protocol):
-    async def start_battle(self, lines: list[str]) -> None: ...
+    async def start_battle(self, lines: list[str]) -> None: ...  # noqa: E704
 
-    async def send_battle_line(self, line: str) -> None: ...
+    async def send_battle_line(self, line: str) -> None: ...  # noqa: E704
 
-    async def send_battle_lines(self, lines: list[str]) -> None: ...
+    async def send_battle_lines(self, lines: list[str]) -> None: ...  # noqa: E704
 
-    async def read_protocol_message(self, timeout: float | None) -> object | None: ...
+    async def read_protocol_message(  # noqa: E704
+        self, timeout: float | None
+    ) -> object | None: ...  # noqa: E704
 
-    async def close_battle(self) -> None: ...
+    async def close_battle(self) -> None: ...  # noqa: E704
+
+    async def describe(self) -> str: ...  # noqa: E704
 
 
 class _LocalBattleStreamWorkerPoolProtocol(Protocol):
-    async def start(self) -> None: ...
+    async def start(self) -> None: ...  # noqa: E704
 
-    async def acquire(self) -> _LocalBattleControllerProtocol: ...
+    async def acquire(self) -> _LocalBattleControllerProtocol: ...  # noqa: E704
 
-    async def release(self, controller: _LocalBattleControllerProtocol) -> None: ...
+    async def release(  # noqa: E704
+        self, controller: _LocalBattleControllerProtocol
+    ) -> None: ...  # noqa: E704
 
-    async def close(self) -> None: ...
+    async def close(self) -> None: ...  # noqa: E704
 
 
 class _LocalWorkerLifecycleProtocol(Protocol):
-    async def start(self) -> None: ...
+    async def start(self) -> None: ...  # noqa: E704
 
-    async def shutdown(self) -> None: ...
+    async def shutdown(self) -> None: ...  # noqa: E704
 
 
 class _AsyncPayloadMailbox:
@@ -217,8 +223,7 @@ atexit.register(_stop_local_worker_pools)
 
 
 def _get_or_create_worker_pool(
-    config: LocalBattleStreamConfiguration,
-    create_pool,
+    config: LocalBattleStreamConfiguration, create_pool
 ) -> _LocalBattleStreamWorkerPoolProtocol:
     with _LOCAL_WORKER_POOLS_LOCK:
         pool = _LOCAL_WORKER_POOLS.get(config)
@@ -349,6 +354,27 @@ class _LocalBattleStreamWorker:
         except asyncio.TimeoutError:
             await self.shutdown()
 
+    async def describe(self) -> str:
+        process = self._process
+        details = [
+            f"worker_index={self._worker_index}",
+            f"battle_id={self._battle_id}",
+            f"pid={getattr(process, 'pid', None)}",
+            f"returncode={getattr(process, 'returncode', None)}",
+            f"active={self._active}",
+            f"ready={self._ready.is_set()}",
+            f"battle_done={self._battle_done.is_set()}",
+            (
+                f"fatal_error={self._fatal_error!s}"
+                if self._fatal_error
+                else "fatal_error=None"
+            ),
+        ]
+        stderr = "\n".join(self._stderr_tail)
+        if stderr:
+            details.append(f"stderr_tail=\n{stderr}")
+        return "; ".join(details)
+
     async def shutdown(self) -> None:
         process = self._process
         if process is None:
@@ -441,7 +467,9 @@ class _LocalBattleStreamWorker:
             self._message_queue.put(payload)
         return True
 
-    async def _handle_stdout_event(self, event: dict[str, object]) -> object | bool | None:
+    async def _handle_stdout_event(
+        self, event: dict[str, object]
+    ) -> object | bool | None:
         event_type = event.get("type")
         if event_type == "ready":
             self._ready.set()
@@ -550,6 +578,9 @@ class _SharedLocalBattleStreamBattleHandle:
 
     async def close_battle(self) -> None:
         await self._worker.close_battle(self._battle_id)
+
+    async def describe(self) -> str:
+        return await self._worker.describe_battle(self._battle_id)
 
     async def release(self) -> None:
         await self._worker.release_battle(self._battle_id)
@@ -680,6 +711,34 @@ class _SharedLocalBattleStreamWorker:
             await asyncio.wait_for(state.battle_done.wait(), timeout=1.0)
         except asyncio.TimeoutError:
             await self.shutdown()
+
+    async def describe_battle(self, battle_id: str) -> str:
+        process = self._process
+        state = self._battle_states.get(battle_id)
+        active_count = sum(
+            1 for battle_state in self._battle_states.values() if battle_state.active
+        )
+        details = [
+            f"worker_index={self._worker_index}",
+            f"battle_id={battle_id}",
+            f"pid={getattr(process, 'pid', None)}",
+            f"returncode={getattr(process, 'returncode', None)}",
+            f"battle_active={state.active if state is not None else None}",
+            f"battle_done={state.battle_done.is_set() if state is not None else None}",
+            f"active_battles={active_count}",
+            f"tracked_battles={len(self._battle_states)}",
+            f"capacity={self._config.max_battles_per_worker}",
+            f"ready={self._ready.is_set()}",
+            (
+                f"fatal_error={self._fatal_error!s}"
+                if self._fatal_error
+                else "fatal_error=None"
+            ),
+        ]
+        stderr = "\n".join(self._stderr_tail)
+        if stderr:
+            details.append(f"stderr_tail=\n{stderr}")
+        return "; ".join(details)
 
     async def release_battle(self, battle_id: str) -> None:
         self._battle_states.pop(battle_id, None)
@@ -823,7 +882,10 @@ class _SharedLocalBattleStreamWorker:
             return None
         if event_type == "end":
             if battle_id is not None:
-                return str(battle_id), {"type": "end", "payload": event.get("payload", "")}
+                return str(battle_id), {
+                    "type": "end",
+                    "payload": event.get("payload", ""),
+                }
             return None
         if event_type == "battle-ended":
             state = self._battle_states.get(str(battle_id))
@@ -1095,6 +1157,14 @@ class _CrossLoopLocalBattleController:
         self._cancel_pending_messages()
         self._cancel_pending_battle_lines()
         await _run_on_loop(self._runtime_controller.close_battle(), self._runtime_loop)
+
+    async def describe(self) -> str:
+        try:
+            return await _run_on_loop(
+                self._runtime_controller.describe(), self._runtime_loop
+            )
+        except Exception as error:
+            return f"failed_to_describe_runtime_controller={error!r}"
 
     def detach(self) -> None:
         self._closed = True
@@ -1506,9 +1576,7 @@ class _CrossLoopLocalBattleStreamWorkerPool:
         if self._session_loop is POKE_LOOP:
             return runtime_controller
         return _CrossLoopLocalBattleController(
-            runtime_controller,
-            self._session_loop,
-            runtime_timeout=None,
+            runtime_controller, self._session_loop, runtime_timeout=None
         )
 
     async def release(self, controller: _LocalBattleControllerProtocol) -> None:
@@ -1872,7 +1940,16 @@ class LocalBattleStreamSession:
         timeout: float | None = self._config.startup_timeout
 
         while True:
-            message = await self._worker.read_protocol_message(timeout)
+            try:
+                message = await self._worker.read_protocol_message(timeout)
+            except asyncio.TimeoutError as exc:
+                if self._battle_started:
+                    raise
+                diagnostics = await self._describe_worker()
+                raise ShowdownException(
+                    "Timed out waiting for initial local BattleStream output "
+                    f"for room {self._room} after {timeout:.1f}s. {diagnostics}"
+                ) from exc
             if message is None:
                 if self._battle_started:
                     return
@@ -2016,6 +2093,14 @@ class LocalBattleStreamSession:
             f"|title|{self._player_1.username} vs. {self._player_2.username}",
         ]
         await self._dispatch_player_payloads(init_lines, init_lines)
+
+    async def _describe_worker(self) -> str:
+        if self._worker is None:
+            return "worker=None"
+        try:
+            return await self._worker.describe()
+        except Exception as error:
+            return f"failed_to_describe_worker={error!r}"
 
     async def _finalize_battle(self) -> None:
         self._accepting_player_messages = False

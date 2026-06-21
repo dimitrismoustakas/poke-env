@@ -72,6 +72,9 @@ class MaxBasePowerPlayer(Player):
                 orders.append(SingleBattleOrder(mon_to_switch_in))
                 switched_in = mon_to_switch_in
                 continue
+            elif Effect.COMMANDER in mon.effects:
+                orders.append(SkippedBattleOrder())
+                continue
             elif not moves:
                 orders.append(DefaultBattleOrder())
                 continue

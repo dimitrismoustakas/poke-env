@@ -111,11 +111,11 @@ def test_choose_random_move_doubles(pseudo_random, example_doubles_request):
 
     pseudo_random.side_effect = lambda: 0.5
     choice = player.choose_random_move(battle)
-    assert choice.message == "/choose move rapidspin 1, switch Raichu"
+    assert choice.message == "/choose move 2 1, switch Raichu"
 
     pseudo_random.side_effect = lambda: 0.999
     choice = player.choose_random_move(battle)
-    assert choice.message == "/choose move slackoff dynamax, move substitute"
+    assert choice.message == "/choose move 4 dynamax, move 4"
 
     battle.switch("p2b: Excadrill", "Excadrill, L50, M", "48/48")
 
@@ -125,11 +125,11 @@ def test_choose_random_move_doubles(pseudo_random, example_doubles_request):
 
     pseudo_random.side_effect = lambda: 0.5
     choice = player.choose_random_move(battle)
-    assert choice.message == "/choose move rapidspin 2, move wildcharge -1"
+    assert choice.message == "/choose move 2 2, move 3 -1"
 
     pseudo_random.side_effect = lambda: 0.999
     choice = player.choose_random_move(battle)
-    assert choice.message == "/choose move slackoff dynamax, move substitute"
+    assert choice.message == "/choose move 4 dynamax, move 4"
 
 
 @patch("poke_env.ps_client.ps_client.PSClient.send_message")

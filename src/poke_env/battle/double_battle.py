@@ -21,52 +21,52 @@ from poke_env.player.battle_order import (
 # the int EMPTY_TARGET_POSITION (0), or None. Positions use the fixed class
 # constants: POKEMON_1_POSITION=-1, POKEMON_2_POSITION=-2,
 # OPPONENT_1_POSITION=1, OPPONENT_2_POSITION=2, EMPTY_TARGET_POSITION=0.
-_EMPTY = 0   # DoubleBattle.EMPTY_TARGET_POSITION
-_P1 = -1     # DoubleBattle.POKEMON_1_POSITION  (slot 0 self / slot 1 ally)
-_P2 = -2     # DoubleBattle.POKEMON_2_POSITION  (slot 0 ally / slot 1 self)
-_O1 = 1      # DoubleBattle.OPPONENT_1_POSITION
-_O2 = 2      # DoubleBattle.OPPONENT_2_POSITION
+_EMPTY = 0  # DoubleBattle.EMPTY_TARGET_POSITION
+_P1 = -1  # DoubleBattle.POKEMON_1_POSITION  (slot 0 self / slot 1 ally)
+_P2 = -2  # DoubleBattle.POKEMON_2_POSITION  (slot 0 ally / slot 1 self)
+_O1 = 1  # DoubleBattle.OPPONENT_1_POSITION
+_O2 = 2  # DoubleBattle.OPPONENT_2_POSITION
 
 _TARGET_POSITIONS: tuple = (
     # Index 0 — slot 0 is active (self=_P1, ally=_P2)
     {
-        Target.ADJACENT_ALLY:         [_P2],
+        Target.ADJACENT_ALLY: [_P2],
         Target.ADJACENT_ALLY_OR_SELF: [_P2, _P1],
-        Target.ADJACENT_FOE:          [_O1, _O2],
-        Target.ALL:                   [_EMPTY],
-        Target.ALL_ADJACENT:          [_EMPTY],
-        Target.ALL_ADJACENT_FOES:     [_EMPTY],
-        Target.ALLIES:                [_EMPTY],
-        Target.ALLY_SIDE:             [_EMPTY],
-        Target.ALLY_TEAM:             [_EMPTY],
-        Target.ANY:                   [_P2, _O1, _O2],
-        Target.FOE_SIDE:              [_EMPTY],
-        Target.NORMAL:                [_P2, _O1, _O2],
-        Target.RANDOM_NORMAL:         [_EMPTY],
-        Target.SCRIPTED:              [_EMPTY],
-        Target.SELF:                  [_EMPTY],
-        _EMPTY:                       [_EMPTY],
-        None:                         [_O1, _O2],
+        Target.ADJACENT_FOE: [_O1, _O2],
+        Target.ALL: [_EMPTY],
+        Target.ALL_ADJACENT: [_EMPTY],
+        Target.ALL_ADJACENT_FOES: [_EMPTY],
+        Target.ALLIES: [_EMPTY],
+        Target.ALLY_SIDE: [_EMPTY],
+        Target.ALLY_TEAM: [_EMPTY],
+        Target.ANY: [_P2, _O1, _O2],
+        Target.FOE_SIDE: [_EMPTY],
+        Target.NORMAL: [_P2, _O1, _O2],
+        Target.RANDOM_NORMAL: [_EMPTY],
+        Target.SCRIPTED: [_EMPTY],
+        Target.SELF: [_EMPTY],
+        _EMPTY: [_EMPTY],
+        None: [_O1, _O2],
     },
     # Index 1 — slot 1 is active (self=_P2, ally=_P1)
     {
-        Target.ADJACENT_ALLY:         [_P1],
+        Target.ADJACENT_ALLY: [_P1],
         Target.ADJACENT_ALLY_OR_SELF: [_P1, _P2],
-        Target.ADJACENT_FOE:          [_O1, _O2],
-        Target.ALL:                   [_EMPTY],
-        Target.ALL_ADJACENT:          [_EMPTY],
-        Target.ALL_ADJACENT_FOES:     [_EMPTY],
-        Target.ALLIES:                [_EMPTY],
-        Target.ALLY_SIDE:             [_EMPTY],
-        Target.ALLY_TEAM:             [_EMPTY],
-        Target.ANY:                   [_P1, _O1, _O2],
-        Target.FOE_SIDE:              [_EMPTY],
-        Target.NORMAL:                [_P1, _O1, _O2],
-        Target.RANDOM_NORMAL:         [_EMPTY],
-        Target.SCRIPTED:              [_EMPTY],
-        Target.SELF:                  [_EMPTY],
-        _EMPTY:                       [_EMPTY],
-        None:                         [_O1, _O2],
+        Target.ADJACENT_FOE: [_O1, _O2],
+        Target.ALL: [_EMPTY],
+        Target.ALL_ADJACENT: [_EMPTY],
+        Target.ALL_ADJACENT_FOES: [_EMPTY],
+        Target.ALLIES: [_EMPTY],
+        Target.ALLY_SIDE: [_EMPTY],
+        Target.ALLY_TEAM: [_EMPTY],
+        Target.ANY: [_P1, _O1, _O2],
+        Target.FOE_SIDE: [_EMPTY],
+        Target.NORMAL: [_P1, _O1, _O2],
+        Target.RANDOM_NORMAL: [_EMPTY],
+        Target.SCRIPTED: [_EMPTY],
+        Target.SELF: [_EMPTY],
+        _EMPTY: [_EMPTY],
+        None: [_O1, _O2],
     },
 )
 
@@ -168,6 +168,44 @@ class DoubleBattle(AbstractBattle):
                     return target
             return None
 
+    def _active_request_pokemon_dict(
+        self,
+        side: Dict[str, Any],
+        active_pokemon_number: int,
+        active_request: Dict[str, Any],
+        used_idents: set[str],
+    ) -> Dict[str, Any]:
+        active_pokemon_dicts = [
+            pokemon_dict
+            for pokemon_dict in side["pokemon"]
+            if pokemon_dict.get("active") and pokemon_dict["ident"] not in used_idents
+        ]
+
+        request_move_ids = {
+            move_request["id"] for move_request in active_request.get("moves", [])
+        }
+        if request_move_ids:
+            candidates = [
+                pokemon_dict
+                for pokemon_dict in active_pokemon_dicts
+                if request_move_ids.issubset(set(pokemon_dict.get("moves", [])))
+            ]
+            if len(candidates) == 1:
+                return candidates[0]
+
+        if self.player_role is not None:
+            slot = "a" if active_pokemon_number == 0 else "b"
+            slot_pokemon = self._active_pokemon.get(f"{self.player_role}{slot}")
+            if slot_pokemon is not None:
+                for pokemon_dict in active_pokemon_dicts:
+                    if self.team.get(pokemon_dict["ident"]) is slot_pokemon:
+                        return pokemon_dict
+
+        if active_pokemon_number < len(active_pokemon_dicts):
+            return active_pokemon_dicts[active_pokemon_number]
+
+        return side["pokemon"][active_pokemon_number]
+
     def parse_request(
         self, request: Dict[str, Any], strict_battle_tracking: bool = False
     ):
@@ -227,8 +265,12 @@ class DoubleBattle(AbstractBattle):
         self._update_team_from_request(side, strict_battle_tracking)
 
         if "active" in request:
+            used_active_idents: set[str] = set()
             for active_pokemon_number, active_request in enumerate(request["active"]):
-                pokemon_dict = request["side"]["pokemon"][active_pokemon_number]
+                pokemon_dict = self._active_request_pokemon_dict(
+                    side, active_pokemon_number, active_request, used_active_idents
+                )
+                used_active_idents.add(pokemon_dict["ident"])
                 active_pokemon = self.get_pokemon(
                     pokemon_dict["ident"],
                     force_self_team=True,

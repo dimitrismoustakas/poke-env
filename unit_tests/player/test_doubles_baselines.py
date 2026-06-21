@@ -1,4 +1,4 @@
-from poke_env.battle import DoubleBattle, Move, Pokemon
+from poke_env.battle import DoubleBattle, Effect, Move, Pokemon
 from poke_env.player import MaxBasePowerPlayer
 
 
@@ -74,3 +74,26 @@ def test_doubles_max_damage_player():
     assert player.choose_move(battle).message in [
         "/choose switch Ponyta, switch Rapidash"
     ]
+
+
+def test_doubles_max_damage_player_omits_commanding_tatsugiri():
+    player = MaxBasePowerPlayer(start_listening=False, battle_format="gen9vgc2026regf")
+    battle = DoubleBattle(
+        battle_tag="placeholder_battle_tag",
+        username="placeholder_username",
+        logger=None,
+        gen=9,
+    )
+    battle.player_role = "p1"
+
+    tatsugiri = Pokemon(species="tatsugiri", gen=9)
+    tatsugiri.switch_in()
+    tatsugiri.effects[Effect.COMMANDER] = 0
+    battle._active_pokemon["p1a"] = tatsugiri
+
+    dondozo = Pokemon(species="dondozo", gen=9)
+    dondozo.switch_in()
+    battle._active_pokemon["p1b"] = dondozo
+    battle._available_moves[1].append(Move("earthquake", gen=9))
+
+    assert player.choose_move(battle).message == "/choose move earthquake"
