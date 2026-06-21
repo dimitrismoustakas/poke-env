@@ -592,6 +592,124 @@ async def test_local_session_treats_win_message_as_terminal_without_stream_end()
     ]
 
 
+@pytest.mark.asyncio
+async def test_local_session_drains_terminal_protocol_batch_for_both_players():
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = DummyClient()
+    session._client_2 = DummyClient()
+    session._accepting_player_messages = True
+
+    finished = await session._dispatch_protocol_payload(
+        {
+            "type": "protocol-batch",
+            "messages": [
+                {
+                    "type": "side-chunk",
+                    "player": "p1",
+                    "messages": [["", "request", "p1-choice"]],
+                },
+                {
+                    "type": "side-chunk",
+                    "player": "p2",
+                    "messages": [["", "request", "p2-choice"]],
+                },
+                {
+                    "type": "side-chunk",
+                    "player": "p1",
+                    "messages": [["", "win", "Player 1"]],
+                },
+                {
+                    "type": "side-chunk",
+                    "player": "p2",
+                    "messages": [["", "win", "Player 1"]],
+                },
+                {"type": "end"},
+                {
+                    "type": "side-chunk",
+                    "player": "p1",
+                    "messages": [["", "request", "unused"]],
+                },
+            ],
+        }
+    )
+
+    assert finished is True
+    assert session._accepting_player_messages is False
+    assert session._client_1.messages == [
+        (
+            "battle-test",
+            [
+                ["", "request", "p1-choice"],
+                ["", "win", "Player 1"],
+            ],
+        )
+    ]
+    assert session._client_2.messages == [
+        (
+            "battle-test",
+            [
+                ["", "request", "p2-choice"],
+                ["", "win", "Player 1"],
+            ],
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_session_replays_global_terminal_result_to_missing_side():
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = DummyClient()
+    session._client_2 = DummyClient()
+    session._accepting_player_messages = True
+
+    finished = await session._dispatch_protocol_payload(
+        {
+            "type": "protocol-batch",
+            "messages": [
+                {
+                    "type": "side-chunk",
+                    "player": "p1",
+                    "messages": [["", "request", "p1-choice"]],
+                },
+                {
+                    "type": "side-chunk",
+                    "player": "p2",
+                    "messages": [["", "request", "p2-choice"]],
+                },
+                {
+                    "type": "side-chunk",
+                    "player": "p1",
+                    "messages": [["", "win", "Player 1"]],
+                },
+                {"type": "end"},
+            ],
+        }
+    )
+
+    assert finished is True
+    assert session._accepting_player_messages is False
+    assert session._client_1.messages == [
+        (
+            "battle-test",
+            [
+                ["", "request", "p1-choice"],
+                ["", "win", "Player 1"],
+            ],
+        )
+    ]
+    assert session._client_2.messages == [
+        (
+            "battle-test",
+            [
+                ["", "request", "p2-choice"],
+                ["", "win", "Player 1"],
+            ],
+        )
+    ]
+
+
 def test_cross_loop_local_controller_detects_terminal_protocol_batch():
     assert _CrossLoopLocalBattleController._is_terminal_payload(
         {
