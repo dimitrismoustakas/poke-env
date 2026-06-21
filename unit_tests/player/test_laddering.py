@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -114,3 +114,33 @@ async def test_laddering_parallel(send_message_mock):
     for i in range(3):
         assert interactions[2 * i] == "Search start"
         assert interactions[2 * i + 1] == "Battle %d start" % i
+
+
+@pytest.mark.asyncio
+async def test_duplicate_terminal_battle_message_is_idempotent():
+    player = RandomPlayer(start_listening=False)
+    room = "battle-gen9randombattle-duplicate-terminal"
+
+    await player.ps_client._handle_message(f">{room}\n|init|battle")
+    await player.ps_client._handle_message(f">{room}\n|win|{player.username}")
+
+    await asyncio.wait_for(
+        player.ps_client._handle_message(f">{room}\n|win|{player.username}"),
+        timeout=0.1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_batch_does_not_answer_obsolete_request():
+    player = RandomPlayer(start_listening=False)
+    room = "battle-gen9randombattle-terminal-request"
+    player._handle_battle_request = AsyncMock()
+
+    await player.ps_client._handle_message(f">{room}\n|init|battle")
+    await player.ps_client._handle_message(
+        f">{room}\n"
+        '|request|{"wait":true,"side":{"pokemon":[]}}\n'
+        f"|win|{player.username}"
+    )
+
+    player._handle_battle_request.assert_not_awaited()

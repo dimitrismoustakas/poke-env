@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 from abc import ABC, abstractmethod
-from asyncio import Condition, Event, Queue, Semaphore
+from asyncio import Condition, Event, Queue, QueueEmpty, Semaphore
 from logging import Logger
 from pathlib import Path
 from time import perf_counter
@@ -242,7 +242,8 @@ class Player(ABC):
 
                 await self._battle_count_queue.put(None)
                 if battle_tag in self._battles:
-                    await self._battle_count_queue.get()
+                    self._battle_count_queue.get_nowait()
+                    self._battle_count_queue.task_done()
                     return self._battles[battle_tag]
                 async with self._battle_start_condition:
                     self._battle_semaphore.release()
@@ -294,6 +295,11 @@ class Player(ABC):
         else:
             battle = await self._get_battle(split_messages[0][0])
 
+        terminal_in_message = any(
+            len(message) > 1 and message[1] in {"win", "tie"}
+            for message in split_messages[1:]
+        )
+
         for split_message in split_messages[1:]:
             if not split_message:
                 continue
@@ -312,7 +318,10 @@ class Player(ABC):
                 if split_message[2]:
                     request = orjson.loads(split_message[2])
                     battle.parse_request(request, self._strict_battle_tracking)
-                    if not (battle.teampreview and self.accept_open_team_sheet):
+                    if (
+                        not terminal_in_message
+                        and not (battle.teampreview and self.accept_open_team_sheet)
+                    ):
                         await self._handle_battle_request(battle)
             elif split_message[1] == "showteam":
                 role = split_message[2]
@@ -324,13 +333,22 @@ class Player(ABC):
                 battle.apply_teambuilder_team(
                     role, teambuilder_team, battle.teampreview_opponent_team
                 )
-                await self._handle_battle_request(battle)
+                if not terminal_in_message:
+                    await self._handle_battle_request(battle)
             elif split_message[1] == "win" or split_message[1] == "tie":
+                if battle.finished:
+                    continue
+                try:
+                    self._battle_count_queue.get_nowait()
+                except QueueEmpty as exc:
+                    raise ShowdownException(
+                        "Received a terminal battle message for "
+                        f"{battle.battle_tag}, but no active battle was tracked."
+                    ) from exc
                 if split_message[1] == "win":
                     battle.won_by(split_message[2])
                 else:
                     battle.tied()
-                await self._battle_count_queue.get()
                 self._battle_count_queue.task_done()
                 self._battle_finished_callback(battle)
                 async with self._battle_end_condition:
