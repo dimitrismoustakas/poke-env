@@ -1705,6 +1705,15 @@ def _payload_to_split_messages(
     return [line.split("|") for line in str(payload).split("\n")]
 
 
+def _payload_has_terminal_battle_message(
+    payload: str | list[str] | list[list[str]] | object,
+) -> bool:
+    return any(
+        len(split_message) > 1 and split_message[1] in {"win", "tie"}
+        for split_message in _payload_to_split_messages(payload)
+    )
+
+
 def _translate_showdown_command(message: str) -> tuple[str, str | None]:
     if message.startswith("/choose "):
         return "choice", message[len("/choose ") :]
@@ -1979,13 +1988,20 @@ class LocalBattleStreamSession:
     async def _dispatch_protocol_batch(self, messages: list[object]) -> bool:
         p1_messages: list[list[str]] = []
         p2_messages: list[list[str]] = []
+        pending_terminal = False
 
-        async def flush_player_messages() -> None:
-            nonlocal p1_messages, p2_messages
+        async def flush_player_messages() -> bool:
+            nonlocal p1_messages, p2_messages, pending_terminal
             if p1_messages or p2_messages:
-                await self._dispatch_player_payloads(p1_messages, p2_messages)
+                terminal = await self._dispatch_player_payloads(
+                    p1_messages, p2_messages, terminal=pending_terminal
+                )
                 p1_messages = []
                 p2_messages = []
+                pending_terminal = False
+                return terminal
+            pending_terminal = False
+            return False
 
         for child_message in messages:
             if not isinstance(child_message, (str, dict)):
@@ -1994,7 +2010,8 @@ class LocalBattleStreamSession:
                 )
 
             if isinstance(child_message, str):
-                await flush_player_messages()
+                if await flush_player_messages():
+                    return True
                 if await self._dispatch_protocol_message(child_message):
                     return True
                 continue
@@ -2009,6 +2026,12 @@ class LocalBattleStreamSession:
                 )
                 p1_messages.extend(_payload_to_split_messages(p1_payload))
                 p2_messages.extend(_payload_to_split_messages(p2_payload))
+                pending_terminal = pending_terminal or (
+                    _payload_has_terminal_battle_message(p1_payload)
+                    or _payload_has_terminal_battle_message(p2_payload)
+                )
+                if pending_terminal:
+                    return await flush_player_messages()
                 continue
             if event_type == "side-chunk":
                 player_slot = str(child_message.get("player", ""))
@@ -2017,24 +2040,35 @@ class LocalBattleStreamSession:
                 )
                 if player_slot == "p1":
                     p1_messages.extend(_payload_to_split_messages(payload))
+                    pending_terminal = pending_terminal or (
+                        _payload_has_terminal_battle_message(payload)
+                    )
+                    if pending_terminal:
+                        return await flush_player_messages()
                     continue
                 if player_slot == "p2":
                     p2_messages.extend(_payload_to_split_messages(payload))
+                    pending_terminal = pending_terminal or (
+                        _payload_has_terminal_battle_message(payload)
+                    )
+                    if pending_terminal:
+                        return await flush_player_messages()
                     continue
                 self._raise_failure(f"Unexpected side-chunk target: {player_slot}")
             if event_type == "end":
-                await flush_player_messages()
+                if await flush_player_messages():
+                    return True
                 self._accepting_player_messages = False
                 return True
             if event_type == "requesteddata":
                 continue
 
-            await flush_player_messages()
+            if await flush_player_messages():
+                return True
             if await self._dispatch_protocol_message(child_message):
                 return True
 
-        await flush_player_messages()
-        return False
+        return await flush_player_messages()
 
     async def _dispatch_protocol_message(
         self, message: str | dict[str, object]
@@ -2048,17 +2082,16 @@ class LocalBattleStreamSession:
                 p2_payload = message.get("p2_messages") or str(
                     message.get("p2_payload", "")
                 )
-                await self._dispatch_player_payloads(p1_payload, p2_payload)
-                return False
+                return await self._dispatch_player_payloads(p1_payload, p2_payload)
             if event_type == "side-chunk":
                 player_slot = str(message.get("player", ""))
                 payload = message.get("messages") or str(message.get("payload", ""))
                 if player_slot == "p1":
                     await self._client_1.dispatch_room_message(self._room, payload)
-                    return False
+                    return self._stop_after_terminal_payload(payload)
                 if player_slot == "p2":
                     await self._client_2.dispatch_room_message(self._room, payload)
-                    return False
+                    return self._stop_after_terminal_payload(payload)
                 self._raise_failure(f"Unexpected side-chunk target: {player_slot}")
             if event_type == "end":
                 self._accepting_player_messages = False
@@ -2068,16 +2101,15 @@ class LocalBattleStreamSession:
         kind, _, payload = message.partition("\n")
         if kind == "update":
             p1_lines, p2_lines = _split_update_for_players(payload)
-            await self._dispatch_player_payloads(p1_lines, p2_lines)
-            return False
+            return await self._dispatch_player_payloads(p1_lines, p2_lines)
         if kind == "sideupdate":
             player_slot, _, body = payload.partition("\n")
             if player_slot == "p1":
                 await self._client_1.dispatch_room_message(self._room, body)
-                return False
+                return self._stop_after_terminal_payload(body)
             if player_slot == "p2":
                 await self._client_2.dispatch_room_message(self._room, body)
-                return False
+                return self._stop_after_terminal_payload(body)
             self._raise_failure(f"Unexpected sideupdate target: {player_slot}")
         if kind == "end":
             self._accepting_player_messages = False
@@ -2128,7 +2160,9 @@ class LocalBattleStreamSession:
         self,
         p1_payload: str | list[str] | list[list[str]],
         p2_payload: str | list[str] | list[list[str]],
-    ) -> None:
+        *,
+        terminal: bool | None = None,
+    ) -> bool:
         dispatches = []
         if p1_payload:
             dispatches.append(self._dispatch_player_payload(self._client_1, p1_payload))
@@ -2136,6 +2170,26 @@ class LocalBattleStreamSession:
             dispatches.append(self._dispatch_player_payload(self._client_2, p2_payload))
         if dispatches:
             await asyncio.gather(*dispatches)
+        if terminal is not None:
+            if terminal:
+                self._accepting_player_messages = False
+            return terminal
+        return self._stop_after_terminal_payloads(p1_payload, p2_payload)
+
+    def _stop_after_terminal_payloads(
+        self,
+        *payloads: str | list[str] | list[list[str]] | object,
+    ) -> bool:
+        if any(_payload_has_terminal_battle_message(payload) for payload in payloads):
+            self._accepting_player_messages = False
+            return True
+        return False
+
+    def _stop_after_terminal_payload(
+        self,
+        payload: str | list[str] | list[list[str]] | object,
+    ) -> bool:
+        return self._stop_after_terminal_payloads(payload)
 
     def _dispatch_player_payload(
         self,

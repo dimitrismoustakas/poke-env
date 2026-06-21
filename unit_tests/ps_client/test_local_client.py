@@ -17,6 +17,7 @@ from poke_env.ps_client.local_client import (
     _SharedLocalBattleStreamWorker,
     _expand_worker_events,
     _get_or_create_worker_pool,
+    _payload_has_terminal_battle_message,
     _protocol_batch_payload,
     _split_update_for_players,
     _translate_showdown_command,
@@ -108,6 +109,19 @@ def test_protocol_batch_payload_flattens_nested_worker_batches():
             {"type": "side-chunk", "player": "p1", "messages": []},
         ],
     }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "|turn|2\n|win|Player 1",
+        ["|turn|2", "|tie"],
+        [["", "win", "Player 1"]],
+        [["", "tie"]],
+    ],
+)
+def test_payload_has_terminal_battle_message(payload):
+    assert _payload_has_terminal_battle_message(payload)
 
 
 @pytest.mark.asyncio
@@ -545,6 +559,37 @@ async def test_local_session_dispatches_protocol_batches_until_terminal():
         ("battle-test", [["", "turn", "1"], ["", "request", "p1"]])
     ]
     assert session._client_2.messages == [("battle-test", [["", "turn", "1"]])]
+
+
+@pytest.mark.asyncio
+async def test_local_session_treats_win_message_as_terminal_without_stream_end():
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = DummyClient()
+    session._client_2 = DummyClient()
+    session._accepting_player_messages = True
+
+    finished = await session._dispatch_protocol_payload(
+        {
+            "type": "protocol-batch",
+            "messages": [
+                {
+                    "type": "split-chunk",
+                    "p1_messages": [["", "turn", "2"], ["", "win", "Player 1"]],
+                    "p2_messages": [["", "turn", "2"], ["", "win", "Player 1"]],
+                },
+            ],
+        }
+    )
+
+    assert finished is True
+    assert session._accepting_player_messages is False
+    assert session._client_1.messages == [
+        ("battle-test", [["", "turn", "2"], ["", "win", "Player 1"]])
+    ]
+    assert session._client_2.messages == [
+        ("battle-test", [["", "turn", "2"], ["", "win", "Player 1"]])
+    ]
 
 
 def test_cross_loop_local_controller_detects_terminal_protocol_batch():
