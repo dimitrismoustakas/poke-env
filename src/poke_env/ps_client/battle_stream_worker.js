@@ -142,7 +142,6 @@ const idleBattleWorkers = [];
 const allBattleWorkers = new Set();
 let closing = false;
 let shutdownStarted = false;
-let commandQueue = Promise.resolve();
 
 function battleWorkerPath() {
     return path.join(__dirname, 'battle_stream_battle_worker.js');
@@ -213,7 +212,8 @@ function handleBattleWorkerEvent(handle, event) {
         return;
     }
 
-    queueEvent({...event, battleId});
+    event.battleId = battleId;
+    queueEvent(event);
 }
 
 function handleBattleWorkerError(handle, error) {
@@ -292,7 +292,7 @@ function writeBattleLines(battleId, lines) {
     handle.worker.postMessage({type: 'write', lines});
 }
 
-async function closeBattle(battleId) {
+function closeBattle(battleId) {
     const handle = activeStreams.get(battleId);
     if (handle) {
         handle.worker.postMessage({type: 'close-battle'});
@@ -301,7 +301,7 @@ async function closeBattle(battleId) {
     }
 }
 
-async function handleCommand(command) {
+function handleCommand(command) {
     switch (command.type) {
     case 'start':
         startBattle(command.battleId, command.lines);
@@ -310,16 +310,16 @@ async function handleCommand(command) {
         writeBattleLines(command.battleId, command.lines);
         break;
     case 'close-battle':
-        await closeBattle(command.battleId);
+        closeBattle(command.battleId);
         break;
     case 'shutdown':
         closing = true;
         if (activeStreams.size > 0) {
             for (const battleId of Array.from(activeStreams.keys())) {
-                await closeBattle(battleId);
+                closeBattle(battleId);
             }
         } else {
-            await finishShutdown();
+            void finishShutdown();
         }
         break;
     default:
@@ -327,20 +327,23 @@ async function handleCommand(command) {
     }
 }
 
+async function failWorker(error) {
+    queueEvent({type: 'error', detail: formatError(error)});
+    await flushEvents();
+    process.exit(1);
+}
+
 function enqueueCommand(rawLine) {
     if (!rawLine.trim()) {
         return;
     }
 
-    commandQueue = commandQueue.then(async () => {
+    try {
         const command = JSON.parse(rawLine);
-        await handleCommand(command);
-    });
-    commandQueue = commandQueue.catch(async error => {
-        queueEvent({type: 'error', detail: formatError(error)});
-        await flushEvents();
-        process.exit(1);
-    });
+        handleCommand(command);
+    } catch (error) {
+        void failWorker(error);
+    }
 }
 
 process.stdin.setEncoding('utf8');
