@@ -4,8 +4,12 @@ from poke_env.player import RandomPlayer
 
 
 async def main():
-    player_1 = RandomPlayer(log_level=25, max_concurrent_battles=1)
-    player_2 = RandomPlayer(log_level=25, max_concurrent_battles=1)
+    player_1 = RandomPlayer(
+        log_level=25, max_concurrent_battles=1, max_finished_battles=1
+    )
+    player_2 = RandomPlayer(
+        log_level=25, max_concurrent_battles=1, max_finished_battles=1
+    )
 
     await player_1.battle_against(player_2, n_battles=1)
 

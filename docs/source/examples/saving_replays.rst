@@ -43,8 +43,8 @@ Explicit Replay Export
 
 
     async def main():
-        p1 = RandomPlayer(max_concurrent_battles=1)
-        p2 = RandomPlayer(max_concurrent_battles=1)
+        p1 = RandomPlayer(max_concurrent_battles=1, max_finished_battles=1)
+        p2 = RandomPlayer(max_concurrent_battles=1, max_finished_battles=1)
 
         await p1.battle_against(p2, n_battles=1)
 
@@ -59,6 +59,11 @@ Explicit Replay Export
 
     if __name__ == "__main__":
         asyncio.run(main())
+
+Finished battle objects are discarded by default. Set
+``max_finished_battles`` to the number of recent battles that should remain
+available for explicit export. Result counters such as ``n_won_battles`` are
+tracked independently.
 
 .. warning:: This example requires a running Pokémon Showdown server. See
    :ref:`configuring a showdown server`.

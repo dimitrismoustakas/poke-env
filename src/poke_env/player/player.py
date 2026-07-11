@@ -62,6 +62,7 @@ class Player(ABC):
         battle_format: str = "gen9randombattle",
         log_level: Optional[int] = None,
         max_concurrent_battles: int = 1,
+        max_finished_battles: int = 0,
         accept_open_team_sheet: bool = False,
         save_replays: Union[bool, str] = False,
         server_configuration: Union[
@@ -91,6 +92,10 @@ class Player(ABC):
         :param max_concurrent_battles: Maximum number of battles this player will play
             concurrently. If 0, no limit will be applied. Defaults to 1.
         :type max_concurrent_battles: int
+        :param max_finished_battles: Maximum number of finished battles to retain in
+            the player's battle history after their rooms are deinitialized. Defaults
+            to 0. Battle result counters are retained independently.
+        :type max_finished_battles: int
         :param accept_open_team_sheet: Boolean to define whether we want to accept or reject open team
             sheet requests
         :type accept_open_team_sheet: bool
@@ -126,13 +131,21 @@ class Player(ABC):
             Defaults to None.
         :type team: str or Teambuilder, optional
         """
+        self._validate_max_finished_battles(max_finished_battles)
+
         self._format: str = battle_format
         self._max_concurrent_battles: int = max_concurrent_battles
+        self._max_finished_battles = max_finished_battles
         self._save_replays = save_replays
         self._start_timer_on_battle_start: bool = start_timer_on_battle_start
         self._accept_open_team_sheet: bool = accept_open_team_sheet
 
         self._battles: Dict[str, AbstractBattle] = {}
+        self._deinitialized_battle_tags: set[str] = set()
+        self._n_finished_battles = 0
+        self._n_lost_battles = 0
+        self._n_tied_battles = 0
+        self._n_won_battles = 0
         self._battle_semaphore: Semaphore = create_in_poke_loop(Semaphore, loop, 0)
 
         self._battle_start_condition: Condition = create_in_poke_loop(Condition, loop)
@@ -214,8 +227,9 @@ class Player(ABC):
             # Battle initialisation
             battle_tag = "-".join(split_message)[1:]
 
-            if battle_tag in self._battles:
-                return self._battles[battle_tag]
+            existing_battle = self._battles.get(battle_tag)
+            if existing_battle is not None:
+                return existing_battle
             else:
                 gen = GenData.from_format(self._format).gen
                 if self.format_is_doubles:
@@ -241,14 +255,16 @@ class Player(ABC):
                     )
 
                 await self._battle_count_queue.put(None)
-                if battle_tag in self._battles:
+                async with self._battle_start_condition:
+                    existing_battle = self._battles.get(battle_tag)
+                    if existing_battle is None:
+                        self._battle_semaphore.release()
+                        self._battle_start_condition.notify_all()
+                        self._battles[battle_tag] = battle
+                if existing_battle is not None:
                     self._battle_count_queue.get_nowait()
                     self._battle_count_queue.task_done()
-                    return self._battles[battle_tag]
-                async with self._battle_start_condition:
-                    self._battle_semaphore.release()
-                    self._battle_start_condition.notify_all()
-                    self._battles[battle_tag] = battle
+                    return existing_battle
 
                 if self._start_timer_on_battle_start:
                     await self.ps_client.send_message("/timer on", battle.battle_tag)
@@ -273,8 +289,9 @@ class Player(ABC):
     async def _get_battle(self, battle_tag: str) -> AbstractBattle:
         battle_tag = battle_tag[1:]
         while True:
-            if battle_tag in self._battles:
-                return self._battles[battle_tag]
+            battle = self._battles.get(battle_tag)
+            if battle is not None:
+                return battle
             async with self._battle_start_condition:
                 await self._battle_start_condition.wait()
 
@@ -300,6 +317,7 @@ class Player(ABC):
             for message in split_messages[1:]
         )
 
+        received_deinit = False
         for split_message in split_messages[1:]:
             if not split_message:
                 continue
@@ -318,9 +336,8 @@ class Player(ABC):
                 if split_message[2]:
                     request = orjson.loads(split_message[2])
                     battle.parse_request(request, self._strict_battle_tracking)
-                    if (
-                        not terminal_in_message
-                        and not (battle.teampreview and self.accept_open_team_sheet)
+                    if not terminal_in_message and not (
+                        battle.teampreview and self.accept_open_team_sheet
                     ):
                         await self._handle_battle_request(battle)
             elif split_message[1] == "showteam":
@@ -350,11 +367,14 @@ class Player(ABC):
                 else:
                     battle.tied()
                 self._battle_count_queue.task_done()
+                self._record_battle_result(battle)
                 self._battle_finished_callback(battle)
                 async with self._battle_end_condition:
                     self._battle_end_condition.notify_all()
                 if hasattr(self.ps_client, "websocket"):
                     await self.ps_client.send_message(f"/leave {battle.battle_tag}")
+                if battle.battle_tag in self._deinitialized_battle_tags:
+                    self._prune_finished_battles()
             elif split_message[1] == "error":
                 self.logger.log(
                     25, "Error message received: %s", "|".join(split_message)
@@ -369,6 +389,37 @@ class Player(ABC):
                 self.logger.warning("Received 'bigerror' message: %s", split_message)
             else:
                 battle.parse_message(split_message)
+                if split_message[1] == "deinit":
+                    self._deinitialized_battle_tags.add(battle.battle_tag)
+                    received_deinit = True
+
+        if received_deinit:
+            self._prune_finished_battles()
+
+    def _prune_finished_battles(self) -> None:
+        eligible_tags = [
+            battle_tag
+            for battle_tag, battle in self._battles.items()
+            if battle.finished and battle_tag in self._deinitialized_battle_tags
+        ]
+        excess = len(eligible_tags) - self._max_finished_battles
+        for battle_tag in eligible_tags[: max(0, excess)]:
+            self._battles.pop(battle_tag, None)
+            self._deinitialized_battle_tags.discard(battle_tag)
+
+    def _record_battle_result(self, battle: AbstractBattle) -> None:
+        self._n_finished_battles += 1
+        if battle.won:
+            self._n_won_battles += 1
+        elif battle.lost:
+            self._n_lost_battles += 1
+        else:
+            self._n_tied_battles += 1
+
+    @staticmethod
+    def _validate_max_finished_battles(value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("max_finished_battles must be a non-negative integer")
 
     async def _handle_battle_request(
         self, battle: AbstractBattle, maybe_default_order: bool = False
@@ -672,6 +723,11 @@ class Player(ABC):
                     "Can not reset player's battles while they are still running"
                 )
         self._battles = {}
+        self._deinitialized_battle_tags.clear()
+        self._n_finished_battles = 0
+        self._n_lost_battles = 0
+        self._n_tied_battles = 0
+        self._n_won_battles = 0
 
     def teampreview(self, battle: AbstractBattle) -> Union[str, Awaitable[str]]:
         """Returns a teampreview order for the given battle.
@@ -768,6 +824,11 @@ class Player(ABC):
         return self._format
 
     @property
+    def max_finished_battles(self) -> int:
+        """Maximum number of deinitialized finished battles retained in history."""
+        return self._max_finished_battles
+
+    @property
     def format_is_doubles(self) -> bool:
         format_lowercase = self._format.lower()
         return (
@@ -778,19 +839,19 @@ class Player(ABC):
 
     @property
     def n_finished_battles(self) -> int:
-        return len([None for b in self._battles.values() if b.finished])
+        return self._n_finished_battles
 
     @property
     def n_lost_battles(self) -> int:
-        return len([None for b in self._battles.values() if b.lost])
+        return self._n_lost_battles
 
     @property
     def n_tied_battles(self) -> int:
-        return self.n_finished_battles - self.n_lost_battles - self.n_won_battles
+        return self._n_tied_battles
 
     @property
     def n_won_battles(self) -> int:
-        return len([None for b in self._battles.values() if b.won])
+        return self._n_won_battles
 
     @property
     def accept_open_team_sheet(self) -> bool:
@@ -798,7 +859,7 @@ class Player(ABC):
 
     @property
     def win_rate(self) -> float:
-        return self.n_won_battles / self.n_finished_battles
+        return self._n_won_battles / self._n_finished_battles
 
     @property
     def logger(self) -> Logger:

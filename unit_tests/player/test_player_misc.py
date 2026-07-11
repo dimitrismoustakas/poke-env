@@ -357,3 +357,93 @@ def test_player_save_replay_raises_on_unknown_battle_tag(tmp_path):
 
     with pytest.raises(KeyError, match="Unknown battle_tag"):
         player.save_replay("battle-gen9randombattle-missing", tmp_path / "missing.html")
+
+
+def _add_finished_battle(player: Player, suffix: int) -> Battle:
+    battle = Battle(
+        f"battle-gen9randombattle-{suffix}", player.username, player.logger, gen=9
+    )
+    battle.won_by(player.username)
+    player._battles[battle.battle_tag] = battle
+    return battle
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, "1", True, None])
+def test_max_finished_battles_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        SimplePlayer(start_listening=False, max_finished_battles=value)
+
+
+@pytest.mark.asyncio
+async def test_finished_battle_history_is_discarded_by_default():
+    player = SimplePlayer(start_listening=False)
+    battles = [_add_finished_battle(player, suffix) for suffix in range(3)]
+
+    for battle in battles:
+        player._record_battle_result(battle)
+        await player._handle_battle_message([[f">{battle.battle_tag}"], ["", "deinit"]])
+
+    assert player.max_finished_battles == 0
+    assert player.battles == {}
+    assert player.n_finished_battles == 3
+    assert player.n_won_battles == 3
+    assert player.win_rate == 1.0
+
+
+@pytest.mark.asyncio
+async def test_finished_battle_history_keeps_newest_deinitialized_battles():
+    player = SimplePlayer(start_listening=False, max_finished_battles=2)
+    battles = [_add_finished_battle(player, suffix) for suffix in range(3)]
+
+    for battle in battles:
+        await player._handle_battle_message([[f">{battle.battle_tag}"], ["", "deinit"]])
+
+    assert list(player.battles) == [battles[1].battle_tag, battles[2].battle_tag]
+
+
+@pytest.mark.asyncio
+async def test_zero_finished_battle_history_prunes_after_complete_deinit_payload():
+    player = SimplePlayer(start_listening=False)
+    battle = _add_finished_battle(player, 1)
+
+    assert battle.battle_tag in player.battles
+    await player._handle_battle_message(
+        [[f">{battle.battle_tag}"], ["", "deinit"], ["", "turn", "9"]]
+    )
+
+    assert battle.turn == 9
+    assert battle.battle_tag not in player.battles
+
+
+def test_reset_battles_clears_history_and_result_counters():
+    player = SimplePlayer(start_listening=False)
+    battle = _add_finished_battle(player, 1)
+    player._record_battle_result(battle)
+    player._deinitialized_battle_tags.add(battle.battle_tag)
+
+    player.reset_battles()
+
+    assert player.battles == {}
+    assert player.n_finished_battles == 0
+    assert player.n_won_battles == 0
+    assert player.n_lost_battles == 0
+    assert player.n_tied_battles == 0
+
+
+def test_record_battle_result_tracks_wins_losses_and_ties_without_history():
+    player = SimplePlayer(start_listening=False)
+    won = Battle("battle-gen9randombattle-win", player.username, player.logger, gen=9)
+    lost = Battle("battle-gen9randombattle-loss", player.username, player.logger, gen=9)
+    tied = Battle("battle-gen9randombattle-tie", player.username, player.logger, gen=9)
+    won.won_by(player.username)
+    lost.won_by("opponent")
+    tied.tied()
+
+    for battle in (won, lost, tied):
+        player._record_battle_result(battle)
+
+    assert player.n_finished_battles == 3
+    assert player.n_won_battles == 1
+    assert player.n_lost_battles == 1
+    assert player.n_tied_battles == 1
+    assert player.win_rate == pytest.approx(1 / 3)
