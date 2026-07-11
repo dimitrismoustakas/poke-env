@@ -131,6 +131,7 @@ class Player(ABC):
             Defaults to None.
         :type team: str or Teambuilder, optional
         """
+        self._validate_max_concurrent_battles(max_concurrent_battles)
         self._validate_max_finished_battles(max_finished_battles)
 
         self._format: str = battle_format
@@ -415,6 +416,11 @@ class Player(ABC):
             self._n_lost_battles += 1
         else:
             self._n_tied_battles += 1
+
+    @staticmethod
+    def _validate_max_concurrent_battles(value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("max_concurrent_battles must be a non-negative integer")
 
     @staticmethod
     def _validate_max_finished_battles(value: int) -> None:
@@ -822,6 +828,11 @@ class Player(ABC):
     @property
     def format(self) -> str:
         return self._format
+
+    @property
+    def max_concurrent_battles(self) -> int:
+        """Maximum number of concurrent battles, or 0 when unlimited."""
+        return self._max_concurrent_battles
 
     @property
     def max_finished_battles(self) -> int:

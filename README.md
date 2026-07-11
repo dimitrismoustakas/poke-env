@@ -63,6 +63,50 @@ if __name__ == "__main__":
 To build your own bot, subclass `Player` and override `choose_move`. The
 quickstart guide walks through that step by step.
 
+### Direct local battles without a server
+
+Training two local agents does not require starting a Showdown web server.
+`LocalBattleStreamConfiguration` launches Node workers against an installed
+Pokemon Showdown checkout and communicates with its BattleStreams directly:
+
+```python
+import asyncio
+from pathlib import Path
+
+from poke_env import LocalBattleStreamConfiguration
+from poke_env.player import RandomPlayer
+
+
+async def main():
+    config = LocalBattleStreamConfiguration(
+        showdown_dir=Path("../pokemon-showdown"),
+        worker_count=2,
+        max_battles_per_worker=2,
+    )
+    player_1 = RandomPlayer(
+        server_configuration=config,
+        max_concurrent_battles=4,
+    )
+    player_2 = RandomPlayer(
+        server_configuration=config,
+        max_concurrent_battles=4,
+    )
+
+    try:
+        await player_1.battle_against(player_2, n_battles=20)
+    finally:
+        await player_1.ps_client.stop_listening()
+        await player_2.ps_client.stop_listening()
+
+
+asyncio.run(main())
+```
+
+Run `npm install` in the Showdown checkout first. Both players must use the
+same local configuration and battle format. This backend is for local
+simulation; ladder searches and battles against websocket players still use a
+Showdown server.
+
 ## Documentation and examples
 
 Documentation, detailed examples, and starting code are available

@@ -1,26 +1,35 @@
 import asyncio
+from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+from types import SimpleNamespace
 
 import pytest
 
+import poke_env.ps_client.local_client as local_client_module
 from poke_env import AccountConfiguration, LocalBattleStreamConfiguration
 from poke_env.concurrency import POKE_LOOP
 from poke_env.exceptions import ShowdownException
 from poke_env.ps_client.local_client import (
-    _AsyncPayloadMailbox,
-    LocalBattleStreamClient,
-    LocalBattleStreamSession,
-    _CrossLoopLocalBattleController,
     _LOCAL_CLIENT_REFCOUNTS,
     _LOCAL_WORKER_POOLS,
-    _SharedBattleState,
-    _SharedLocalBattleStreamWorker,
+    LocalBattleStreamClient,
+    LocalBattleStreamSession,
+    _AsyncPayloadMailbox,
+    _CrossLoopLocalBattleController,
     _expand_worker_events,
     _get_or_create_worker_pool,
+    _LocalRuntimeShard,
     _payload_has_terminal_battle_message,
     _protocol_batch_payload,
+    _SharedBattleState,
+    _SharedLocalBattleStreamWorker,
+    _SharedLocalBattleStreamWorkerPool,
     _split_update_for_players,
+    _start_worker_group,
     _translate_showdown_command,
+    _worker_group_start_concurrency,
+    run_local_battles,
 )
 
 
@@ -35,9 +44,16 @@ class DummySession:
 class DummyWorker:
     def __init__(self):
         self.lines: list[str] = []
+        self.line_batches: list[list[str]] = []
 
     async def send_battle_line(self, line: str) -> None:
         self.lines.append(line)
+
+    async def send_battle_lines(self, lines: list[str]) -> None:
+        self.line_batches.append(list(lines))
+
+    async def describe(self) -> str:
+        return "dummy_worker active=True"
 
 
 class DummyClient:
@@ -48,6 +64,32 @@ class DummyClient:
         self, room: str, payload: str | list[str] | list[list[str]]
     ) -> None:
         self.messages.append((room, payload))
+
+
+def _local_runner_players(
+    monkeypatch,
+    config: LocalBattleStreamConfiguration,
+    player_1_limit: int,
+    player_2_limit: int,
+):
+    class RunnerClient:
+        def __init__(self):
+            self.local_server_configuration = config
+            self.loop = asyncio.get_running_loop()
+
+    monkeypatch.setattr(local_client_module, "LocalBattleStreamClient", RunnerClient)
+    return (
+        SimpleNamespace(
+            ps_client=RunnerClient(),
+            format="gen9randombattle",
+            max_concurrent_battles=player_1_limit,
+        ),
+        SimpleNamespace(
+            ps_client=RunnerClient(),
+            format="gen9randombattle",
+            max_concurrent_battles=player_2_limit,
+        ),
+    )
 
 
 def test_split_update_for_players():
@@ -147,6 +189,92 @@ async def test_shared_worker_global_error_event_is_terminal_without_unpack_error
     assert "worker failed" in str(payload)
 
 
+@pytest.mark.asyncio
+async def test_shared_worker_battle_started_event_acknowledges_start():
+    worker = _SharedLocalBattleStreamWorker(
+        LocalBattleStreamConfiguration("C:/showdown"), worker_index=0
+    )
+    start_ack = asyncio.get_running_loop().create_future()
+    worker._battle_states["battle-1"] = _SharedBattleState(
+        message_queue=_AsyncPayloadMailbox(),
+        battle_done=asyncio.Event(),
+        battle_started=start_ack,
+    )
+
+    result = await worker._handle_stdout_events(
+        [{"type": "battle-started", "battleId": "battle-1"}]
+    )
+
+    assert result is True
+    assert start_ack.done()
+    assert start_ack.result() is None
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_battle_end_before_start_ack_fails_start_future():
+    worker = _SharedLocalBattleStreamWorker(
+        LocalBattleStreamConfiguration("C:/showdown"), worker_index=0
+    )
+    start_ack = asyncio.get_running_loop().create_future()
+    state = _SharedBattleState(
+        message_queue=_AsyncPayloadMailbox(),
+        battle_done=asyncio.Event(),
+        battle_started=start_ack,
+    )
+    worker._battle_states["battle-1"] = state
+
+    result = await worker._handle_stdout_events(
+        [{"type": "battle-ended", "battleId": "battle-1"}]
+    )
+
+    assert result is True
+    assert state.active is False
+    assert state.battle_done.is_set()
+    assert start_ack.done()
+    with pytest.raises(ShowdownException, match="before start was acknowledged"):
+        start_ack.result()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_start_limiter_does_not_hold_until_ack():
+    commands = []
+
+    async def start():
+        return None
+
+    async def send_command(command):
+        commands.append(command)
+
+    worker = object.__new__(_SharedLocalBattleStreamWorker)
+    worker._config = LocalBattleStreamConfiguration("C:/showdown", startup_timeout=1.0)
+    worker._start_limiter = asyncio.Semaphore(1)
+    worker._fatal_error = None
+    worker._battle_states = {
+        "battle-1": _SharedBattleState(
+            message_queue=_AsyncPayloadMailbox(),
+            battle_done=asyncio.Event(),
+            battle_started=asyncio.get_running_loop().create_future(),
+        ),
+        "battle-2": _SharedBattleState(
+            message_queue=_AsyncPayloadMailbox(),
+            battle_done=asyncio.Event(),
+            battle_started=asyncio.get_running_loop().create_future(),
+        ),
+    }
+    worker.start = start
+    worker._send_command = send_command
+
+    first = asyncio.create_task(worker.start_battle("battle-1", [">start one"]))
+    second = asyncio.create_task(worker.start_battle("battle-2", [">start two"]))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert [command["battleId"] for command in commands] == ["battle-1", "battle-2"]
+    worker._battle_states["battle-1"].battle_started.set_result(None)
+    worker._battle_states["battle-2"].battle_started.set_result(None)
+    await asyncio.gather(first, second)
+
+
 @pytest.mark.parametrize(
     ("message", "expected"),
     [
@@ -172,11 +300,7 @@ def test_get_or_create_worker_pool_is_thread_safe():
         pass
 
     config = LocalBattleStreamConfiguration(
-        "C:/showdown",
-        worker_count=4,
-        max_battles_per_worker=4,
-        pool_mode="shared",
-        runtime_loop_count=2,
+        "C:/showdown", worker_count=4, max_battles_per_worker=4, runtime_loop_count=2
     )
     created = []
 
@@ -199,6 +323,227 @@ def test_get_or_create_worker_pool_is_thread_safe():
         assert _LOCAL_WORKER_POOLS[config] is pools[0]
     finally:
         _LOCAL_WORKER_POOLS.clear()
+
+
+def test_worker_group_start_concurrency_matches_parent_workers():
+    assert (
+        _worker_group_start_concurrency(worker_count=24, max_battles_per_worker=3) == 24
+    )
+    assert (
+        _worker_group_start_concurrency(worker_count=4, max_battles_per_worker=1) == 4
+    )
+    assert (
+        _worker_group_start_concurrency(worker_count=1, max_battles_per_worker=3) == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_worker_group_limits_concurrent_starts():
+    active_starts = 0
+    max_active_starts = 0
+
+    class DummyLifecycle:
+        async def start(self):
+            nonlocal active_starts, max_active_starts
+            active_starts += 1
+            max_active_starts = max(max_active_starts, active_starts)
+            await asyncio.sleep(0.01)
+            active_starts -= 1
+
+        async def shutdown(self):
+            return None
+
+    workers = [DummyLifecycle() for _ in range(6)]
+
+    await _start_worker_group(workers, max_concurrent=2)
+
+    assert max_active_starts == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_pool_close_shuts_workers_down_in_parallel():
+    release_shutdown = asyncio.Event()
+    all_started = asyncio.Event()
+    started = []
+
+    class BlockingWorker:
+        def __init__(self, worker_id):
+            self.worker_id = worker_id
+
+        async def shutdown(self):
+            started.append(self.worker_id)
+            if len(started) == 3:
+                all_started.set()
+            await release_shutdown.wait()
+
+    pool = _SharedLocalBattleStreamWorkerPool(
+        LocalBattleStreamConfiguration("C:/showdown")
+    )
+    pool._workers = [BlockingWorker(worker_id) for worker_id in range(3)]
+    pool._started = True
+
+    close_task = asyncio.create_task(pool.close())
+    try:
+        await asyncio.wait_for(all_started.wait(), timeout=1.0)
+    finally:
+        release_shutdown.set()
+    await close_task
+
+    assert sorted(started) == [0, 1, 2]
+    assert pool._workers == []
+    assert pool._started is False
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_pool_close_finishes_cleanup_before_propagating_cancel():
+    shutdown_started = asyncio.Event()
+    release_shutdown = asyncio.Event()
+    shutdown_finished = asyncio.Event()
+
+    class BlockingWorker:
+        async def shutdown(self):
+            shutdown_started.set()
+            await release_shutdown.wait()
+            shutdown_finished.set()
+
+    pool = _SharedLocalBattleStreamWorkerPool(
+        LocalBattleStreamConfiguration("C:/showdown")
+    )
+    pool._workers = [BlockingWorker()]
+    pool._started = True
+
+    close_task = asyncio.create_task(pool.close())
+    await asyncio.wait_for(shutdown_started.wait(), timeout=1.0)
+    close_task.cancel()
+    await asyncio.sleep(0)
+    assert not close_task.done()
+
+    release_shutdown.set()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    assert shutdown_finished.is_set()
+    assert pool._workers == []
+    assert pool._started is False
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_pool_rejects_missing_showdown_entrypoint(tmp_path):
+    pool = _SharedLocalBattleStreamWorkerPool(LocalBattleStreamConfiguration(tmp_path))
+
+    with pytest.raises(ShowdownException, match="pokemon-showdown entrypoint"):
+        await pool.start()
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_pool_limits_concurrent_start_command_submissions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    active_starts = 0
+    max_active_starts = 0
+
+    async def fake_start(self):
+        return None
+
+    async def fake_send_start_command_unlimited(self, battle_id, lines):
+        nonlocal active_starts, max_active_starts
+        active_starts += 1
+        max_active_starts = max(max_active_starts, active_starts)
+        await asyncio.sleep(0.01)
+        active_starts -= 1
+        return self._battle_states[battle_id]
+
+    async def fake_wait_for_start_ack(self, battle_id, state):
+        return None
+
+    monkeypatch.setattr(_SharedLocalBattleStreamWorker, "start", fake_start)
+    monkeypatch.setattr(
+        _SharedLocalBattleStreamWorker,
+        "_send_start_command_unlimited",
+        fake_send_start_command_unlimited,
+    )
+    monkeypatch.setattr(
+        _SharedLocalBattleStreamWorker, "_wait_for_start_ack", fake_wait_for_start_ack
+    )
+
+    (tmp_path / "pokemon-showdown").touch()
+    pool = _SharedLocalBattleStreamWorkerPool(
+        LocalBattleStreamConfiguration(
+            tmp_path, worker_count=2, max_battles_per_worker=4
+        )
+    )
+    await pool.start()
+    handles = [await pool.acquire() for _ in range(6)]
+
+    await asyncio.gather(*(handle.start_battle([">start {}"]) for handle in handles))
+
+    assert max_active_starts == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_passes_battle_capacity_to_parent_process(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+
+    class FakeStream:
+        def __init__(self, lines):
+            self._lines = list(lines)
+
+        async def readline(self):
+            return self._lines.pop(0) if self._lines else b""
+
+    class FakeStdin:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            pass
+
+        def is_closing(self):
+            return False
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStream([b'{"type":"ready"}\n'])
+            self.stderr = FakeStream([])
+            self.returncode = 0
+            self.pid = 1234
+
+        async def wait(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 1
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    worker = _SharedLocalBattleStreamWorker(
+        LocalBattleStreamConfiguration(
+            "C:/showdown", node_command=("node-test",), max_battles_per_worker=5
+        ),
+        worker_index=0,
+    )
+
+    await worker.start()
+
+    assert calls
+    args, kwargs = calls[0]
+    assert args[0] == "node-test"
+    assert str(args[2]).replace("\\", "/") == "C:/showdown"
+    assert args[3] == "5"
+    assert str(kwargs["cwd"]).replace("\\", "/") == "C:/showdown"
 
 
 @pytest.mark.asyncio
@@ -244,6 +589,26 @@ async def test_local_client_dispatches_payload_strings_and_cleans_deinit_lock():
     ]
     assert "battle-gen9randombattle-1" not in client._battle_locks
     await client.stop_listening()
+
+
+@pytest.mark.asyncio
+async def test_local_client_dispatch_propagates_cancelled_battle_message():
+    async def on_battle_message(split_messages):
+        del split_messages
+        raise asyncio.CancelledError()
+
+    client = LocalBattleStreamClient(
+        account_configuration=AccountConfiguration("local-user", None),
+        on_battle_message=on_battle_message,
+        server_configuration=LocalBattleStreamConfiguration("C:/showdown"),
+        loop=POKE_LOOP,
+    )
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await client.dispatch_room_message("battle-gen9randombattle-1", "|turn|1")
+    finally:
+        await client.stop_listening()
 
 
 @pytest.mark.asyncio
@@ -311,6 +676,121 @@ async def test_local_client_stop_listening_closes_pool_after_last_client():
 
 
 @pytest.mark.asyncio
+async def test_local_client_cancelled_stop_finishes_unregistered_pool_close():
+    close_started = Event()
+    release_close = Event()
+    close_finished = Event()
+
+    class SlowPool:
+        async def close(self) -> None:
+            close_started.set()
+            await asyncio.to_thread(release_close.wait)
+            close_finished.set()
+
+    config = LocalBattleStreamConfiguration("C:/showdown")
+    _LOCAL_WORKER_POOLS.clear()
+    _LOCAL_CLIENT_REFCOUNTS.clear()
+    _LOCAL_WORKER_POOLS[config] = SlowPool()
+    client = LocalBattleStreamClient(
+        account_configuration=AccountConfiguration("local-user", None),
+        server_configuration=config,
+        loop=POKE_LOOP,
+    )
+
+    stop_task = asyncio.create_task(client.stop_listening())
+    assert await asyncio.to_thread(close_started.wait, 1.0)
+    stop_task.cancel()
+    try:
+        await asyncio.sleep(0.05)
+        assert not close_finished.is_set()
+    finally:
+        release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    assert close_finished.wait(timeout=1.0)
+    assert config not in _LOCAL_CLIENT_REFCOUNTS
+    assert config not in _LOCAL_WORKER_POOLS
+
+
+@pytest.mark.asyncio
+async def test_local_client_retries_failed_last_client_pool_close():
+    class FailOncePool:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("first close failed")
+
+    config = LocalBattleStreamConfiguration("C:/showdown")
+    pool = FailOncePool()
+    _LOCAL_WORKER_POOLS.clear()
+    _LOCAL_CLIENT_REFCOUNTS.clear()
+    _LOCAL_WORKER_POOLS[config] = pool
+    client = LocalBattleStreamClient(
+        account_configuration=AccountConfiguration("local-user", None),
+        server_configuration=config,
+        loop=POKE_LOOP,
+    )
+
+    with pytest.raises(RuntimeError, match="first close failed"):
+        await client.stop_listening()
+
+    assert client._stopped is True
+    assert client._pending_pool_close is pool
+    assert _LOCAL_WORKER_POOLS[config] is pool
+    assert config not in _LOCAL_CLIENT_REFCOUNTS
+
+    await client.stop_listening()
+
+    assert pool.close_calls == 2
+    assert client._pending_pool_close is None
+    assert config not in _LOCAL_WORKER_POOLS
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_close_does_not_overwrite_newer_registered_pool():
+    config = LocalBattleStreamConfiguration("C:/showdown")
+    replacement_pool = object()
+
+    class ReplacedFailOncePool:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                _LOCAL_WORKER_POOLS[config] = replacement_pool
+                raise RuntimeError("old pool close failed")
+
+    old_pool = ReplacedFailOncePool()
+    _LOCAL_WORKER_POOLS.clear()
+    _LOCAL_CLIENT_REFCOUNTS.clear()
+    _LOCAL_WORKER_POOLS[config] = old_pool
+    client = LocalBattleStreamClient(
+        account_configuration=AccountConfiguration("local-user", None),
+        server_configuration=config,
+        loop=POKE_LOOP,
+    )
+
+    with pytest.raises(RuntimeError, match="old pool close failed"):
+        await client.stop_listening()
+
+    assert _LOCAL_WORKER_POOLS[config] is replacement_pool
+    assert client._pending_pool_close is old_pool
+
+    await client.stop_listening()
+
+    assert old_pool.close_calls == 2
+    assert client._pending_pool_close is None
+    assert _LOCAL_WORKER_POOLS[config] is replacement_pool
+    _LOCAL_WORKER_POOLS.clear()
+
+
+@pytest.mark.asyncio
 async def test_local_client_stop_listening_is_idempotent():
     class DummyPool:
         def __init__(self):
@@ -340,6 +820,35 @@ async def test_local_client_stop_listening_is_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_local_client_concurrent_stop_closes_pool_once():
+    class SlowPool:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0.05)
+
+    config = LocalBattleStreamConfiguration("C:/showdown")
+    pool = SlowPool()
+    _LOCAL_WORKER_POOLS.clear()
+    _LOCAL_CLIENT_REFCOUNTS.clear()
+    _LOCAL_WORKER_POOLS[config] = pool
+    client = LocalBattleStreamClient(
+        account_configuration=AccountConfiguration("local-user", None),
+        server_configuration=config,
+        loop=POKE_LOOP,
+    )
+
+    await asyncio.gather(client.stop_listening(), client.stop_listening())
+
+    assert pool.close_calls == 1
+    assert client._pending_pool_close is None
+    assert config not in _LOCAL_CLIENT_REFCOUNTS
+    assert config not in _LOCAL_WORKER_POOLS
+
+
+@pytest.mark.asyncio
 async def test_local_session_ignores_late_player_messages_after_battle_end():
     session = object.__new__(LocalBattleStreamSession)
     session._accepting_player_messages = False
@@ -361,7 +870,23 @@ async def test_local_session_stops_accepting_messages_after_forfeit():
 
 
 @pytest.mark.asyncio
-async def test_local_session_keeps_active_battles_idle_without_event_timeout():
+async def test_local_session_sends_each_choice_immediately():
+    session = object.__new__(LocalBattleStreamSession)
+    session._accepting_player_messages = True
+    session._worker = DummyWorker()
+
+    await session.send_player_message("p1", "/choose move 1")
+
+    assert session._worker.lines == [">p1 move 1"]
+
+    await session.send_player_message("p2", "/choose move 2")
+
+    assert session._worker.lines == [">p1 move 1", ">p2 move 2"]
+    assert session._worker.line_batches == []
+
+
+@pytest.mark.asyncio
+async def test_local_session_keeps_active_battles_idle_without_timeout():
     class RecordingWorker:
         def __init__(self):
             self.timeouts: list[float | None] = []
@@ -379,9 +904,7 @@ async def test_local_session_keeps_active_battles_idle_without_event_timeout():
             return self.messages.pop(0)
 
     session = object.__new__(LocalBattleStreamSession)
-    session._config = LocalBattleStreamConfiguration(
-        "C:/showdown", startup_timeout=1.5, event_timeout=0.01
-    )
+    session._config = LocalBattleStreamConfiguration("C:/showdown", startup_timeout=1.5)
     session._battle_started = False
     session._worker = RecordingWorker()
     start_calls = 0
@@ -499,6 +1022,358 @@ async def test_local_session_dispatches_player_updates_concurrently():
 
 
 @pytest.mark.asyncio
+async def test_local_session_does_not_wait_for_parse_only_update_dispatch():
+    release = asyncio.Event()
+    p1_started = asyncio.Event()
+    p2_started = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self, player: str):
+            self.player = player
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            assert payload == ["|turn|1"]
+            if self.player == "p1":
+                p1_started.set()
+            else:
+                p2_started.set()
+            await release.wait()
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = BlockingClient("p1")
+    session._client_2 = BlockingClient("p2")
+    session._accepting_player_messages = True
+
+    finished = await session._dispatch_protocol_message("update\n|turn|1")
+
+    assert finished is False
+    await asyncio.wait_for(p1_started.wait(), timeout=0.2)
+    await asyncio.wait_for(p2_started.wait(), timeout=0.2)
+    release.set()
+    await session._wait_for_dispatches()
+
+
+@pytest.mark.asyncio
+async def test_local_session_actionable_split_request_waits_for_dispatch_before_reader_advances():
+    release = asyncio.Event()
+    p1_started = asyncio.Event()
+    p2_started = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self, player: str):
+            self.player = player
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            if self.player == "p1":
+                assert payload == '|turn|1\n|request|{"active":[{}]}'
+                p1_started.set()
+            else:
+                assert payload == '|turn|1\n|request|{"active":[{}]}'
+                p2_started.set()
+            await release.wait()
+            await session.send_player_message(
+                self.player, f"/choose move {1 if self.player == 'p1' else 2}"
+            )
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = BlockingClient("p1")
+    session._client_2 = BlockingClient("p2")
+    session._accepting_player_messages = True
+    session._worker = DummyWorker()
+
+    dispatch_task = asyncio.create_task(
+        session._dispatch_protocol_message(
+            {
+                "type": "split-chunk",
+                "p1_payload": '|turn|1\n|request|{"active":[{}]}',
+                "p2_payload": '|turn|1\n|request|{"active":[{}]}',
+            }
+        )
+    )
+
+    await asyncio.wait_for(p1_started.wait(), timeout=0.2)
+    await asyncio.wait_for(p2_started.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+    assert not dispatch_task.done()
+
+    release.set()
+    assert await asyncio.wait_for(dispatch_task, timeout=0.2) is False
+    assert session._worker.line_batches == [[">p1 move 1", ">p2 move 2"]]
+    await session._wait_for_dispatches()
+
+
+@pytest.mark.asyncio
+async def test_local_session_wait_request_dispatch_runs_without_reader_barrier():
+    release = asyncio.Event()
+    p1_started = asyncio.Event()
+    p2_started = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self, player: str):
+            self.player = player
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            if self.player == "p1":
+                assert payload == '|turn|1\n|request|{"wait":true}'
+                p1_started.set()
+            else:
+                assert payload == '|turn|1\n|request|{"wait":true}'
+                p2_started.set()
+            await release.wait()
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = BlockingClient("p1")
+    session._client_2 = BlockingClient("p2")
+    session._accepting_player_messages = True
+
+    dispatch_task = asyncio.create_task(
+        session._dispatch_protocol_message(
+            {
+                "type": "split-chunk",
+                "p1_payload": '|turn|1\n|request|{"wait":true}',
+                "p2_payload": '|turn|1\n|request|{"wait":true}',
+            }
+        )
+    )
+
+    await asyncio.wait_for(p1_started.wait(), timeout=0.2)
+    await asyncio.wait_for(p2_started.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+    assert dispatch_task.done()
+    assert dispatch_task.result() is False
+
+    release.set()
+    await session._wait_for_dispatches()
+
+
+@pytest.mark.asyncio
+async def test_local_session_dispatches_concurrent_choices_exactly_once():
+    class ChoosingClient:
+        def __init__(self, session, player: str, choice: str):
+            self.session = session
+            self.player = player
+            self.choice = choice
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            await self.session.send_player_message(self.player, self.choice)
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ChoosingClient(session, "p1", "/choose move 1")
+    session._client_2 = ChoosingClient(session, "p2", "/choose move 2")
+
+    finished = await session._dispatch_player_payloads(
+        [["", "request", '{"active":[{}]}']],
+        [["", "request", '{"active":[{}]}']],
+        wait_for_dispatch=True,
+    )
+
+    assert finished is False
+    assert session._worker.lines == []
+    assert session._worker.line_batches == [[">p1 move 1", ">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_local_session_first_choice_returns_while_peer_is_blocked():
+    peer_release = asyncio.Event()
+    first_choice_sent = asyncio.Event()
+
+    class ChoosingClient:
+        def __init__(self, session, player: str, choice: str):
+            self.session = session
+            self.player = player
+            self.choice = choice
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            if self.player == "p2":
+                await peer_release.wait()
+            await self.session.send_player_message(self.player, self.choice)
+            if self.player == "p1":
+                first_choice_sent.set()
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ChoosingClient(session, "p1", "/choose move 1")
+    session._client_2 = ChoosingClient(session, "p2", "/choose move 2")
+
+    dispatch_task = asyncio.create_task(
+        session._dispatch_player_payloads(
+            [["", "request", '{"active":[{}]}']],
+            [["", "request", '{"active":[{}]}']],
+            wait_for_dispatch=True,
+        )
+    )
+
+    await asyncio.wait_for(first_choice_sent.wait(), timeout=0.2)
+    assert session._worker.lines == []
+    assert session._worker.line_batches == []
+    assert not dispatch_task.done()
+
+    peer_release.set()
+    assert await asyncio.wait_for(dispatch_task, timeout=0.2) is False
+    assert session._worker.lines == []
+    assert session._worker.line_batches == [[">p1 move 1", ">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_local_session_flushes_single_actionable_choice():
+    class ChoosingClient:
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            await session.send_player_message("p1", "/choose move 1")
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ChoosingClient()
+    session._client_2 = DummyClient()
+
+    finished = await session._dispatch_player_payloads(
+        [["", "request", '{"active":[{}]}']],
+        [["", "request", '{"wait":true}']],
+        wait_for_dispatch=True,
+    )
+
+    assert finished is False
+    assert session._worker.lines == []
+    assert session._worker.line_batches == [[">p1 move 1"]]
+
+
+@pytest.mark.asyncio
+async def test_local_session_missing_actionable_choice_fails_after_dispatch():
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = DummyClient()
+    session._client_2 = DummyClient()
+
+    with pytest.raises(
+        ShowdownException, match="without submitting choices for p1, p2"
+    ):
+        await session._dispatch_player_payloads(
+            [["", "request", '{"active":[{}]}']],
+            [["", "request", '{"active":[{}]}']],
+            wait_for_dispatch=True,
+        )
+
+    assert session._pending_choice_batch is None
+    assert session._worker.lines == []
+    assert session._worker.line_batches == []
+
+
+@pytest.mark.asyncio
+async def test_local_session_callback_failure_discards_collected_choices():
+    class ChoosingClient:
+        async def dispatch_room_message(self, room, payload) -> None:
+            await session.send_player_message("p1", "/choose move 1")
+
+    class FailingClient:
+        async def dispatch_room_message(self, room, payload) -> None:
+            raise RuntimeError("dispatch failed")
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ChoosingClient()
+    session._client_2 = FailingClient()
+
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        await session._dispatch_player_payloads(
+            [["", "request", '{"active":[{}]}']],
+            [["", "request", '{"active":[{}]}']],
+            wait_for_dispatch=True,
+        )
+
+    assert session._pending_choice_batch is None
+    assert session._worker.lines == []
+    assert session._worker.line_batches == []
+    assert isinstance(session._dispatch_failure.exception(), RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_local_session_forfeit_bypasses_pending_choice_batch():
+    class ForfeitingClient:
+        async def dispatch_room_message(self, room, payload) -> None:
+            await session.send_player_message("p1", "/forfeit")
+
+    class ChoosingClient:
+        async def dispatch_room_message(self, room, payload) -> None:
+            await session.send_player_message("p2", "/choose move 2")
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ForfeitingClient()
+    session._client_2 = ChoosingClient()
+
+    assert (
+        await session._dispatch_player_payloads(
+            [["", "request", '{"active":[{}]}']],
+            [["", "request", '{"active":[{}]}']],
+            wait_for_dispatch=True,
+        )
+        is False
+    )
+
+    assert session._accepting_player_messages is False
+    assert session._pending_choice_batch is None
+    assert session._worker.lines == [">forcelose p1"]
+    assert session._worker.line_batches == []
+
+
+@pytest.mark.asyncio
+async def test_local_session_dispatches_async_choices_exactly_once():
+    release = asyncio.Event()
+
+    class ChoosingClient:
+        def __init__(self, session, player: str, choice: str):
+            self.session = session
+            self.player = player
+            self.choice = choice
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            await release.wait()
+            await self.session.send_player_message(self.player, self.choice)
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ChoosingClient(session, "p1", "/choose move 1")
+    session._client_2 = ChoosingClient(session, "p2", "/choose move 2")
+
+    finished = await session._dispatch_player_payloads(
+        [["", "request", '{"active":[{}]}']],
+        [["", "request", '{"active":[{}]}']],
+        wait_for_dispatch=False,
+    )
+
+    assert finished is False
+    assert session._worker.line_batches == []
+    release.set()
+    await session._wait_for_dispatches()
+    assert sorted(session._worker.lines) == [">p1 move 1", ">p2 move 2"]
+    assert session._worker.line_batches == []
+
+
+@pytest.mark.asyncio
 async def test_local_session_single_side_request_does_not_block_other_side():
     p2_release = asyncio.Event()
     p1_received = asyncio.Event()
@@ -523,21 +1398,13 @@ async def test_local_session_single_side_request_does_not_block_other_side():
 
     assert (
         await session._dispatch_protocol_message(
-            {
-                "type": "side-chunk",
-                "player": "p2",
-                "messages": [["", "request", "p2"]],
-            }
+            {"type": "side-chunk", "player": "p2", "messages": [["", "request", "p2"]]}
         )
         is False
     )
     assert (
         await session._dispatch_protocol_message(
-            {
-                "type": "side-chunk",
-                "player": "p1",
-                "messages": [["", "request", "p1"]],
-            }
+            {"type": "side-chunk", "player": "p1", "messages": [["", "request", "p1"]]}
         )
         is False
     )
@@ -546,12 +1413,153 @@ async def test_local_session_single_side_request_does_not_block_other_side():
     p2_release.set()
     await session._wait_for_dispatches()
 
-    assert session._client_1.messages == [
-        ("battle-test", [["", "request", "p1"]])
+    assert session._client_1.messages == [("battle-test", [["", "request", "p1"]])]
+    assert session._client_2.messages == [("battle-test", [["", "request", "p2"]])]
+
+
+@pytest.mark.asyncio
+async def test_local_session_describe_includes_live_structure():
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._battle_started = True
+    session._accepting_player_messages = True
+    session._worker = DummyWorker()
+    session._dispatch_tasks = set()
+    session._dispatch_failure = asyncio.get_running_loop().create_future()
+
+    await session.send_player_message("p1", "/choose move 1")
+
+    description = await session.describe()
+
+    assert session._worker.lines == [">p1 move 1"]
+    assert "battle_started=True" in description
+    assert "accepting_player_messages=True" in description
+    assert "dispatch_pending=0" in description
+    assert "dummy_worker active=True" in description
+    assert "move 1" not in description
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_write_completes_after_command_delivery():
+    commands = []
+
+    async def send_command(command):
+        commands.append(command)
+
+    state = _SharedBattleState(
+        message_queue=_AsyncPayloadMailbox(), battle_done=asyncio.Event()
+    )
+    worker = object.__new__(_SharedLocalBattleStreamWorker)
+    worker._fatal_error = None
+    worker._battle_states = {"battle-1": state}
+    worker._send_command = send_command
+
+    await worker.send_battle_lines("battle-1", [">p2 move 2"])
+
+    assert commands == [
+        {"type": "write", "battleId": "battle-1", "lines": [">p2 move 2"]}
     ]
-    assert session._client_2.messages == [
-        ("battle-test", [["", "request", "p2"]])
-    ]
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_battle_ended_wakes_protocol_reader():
+    state = _SharedBattleState(
+        message_queue=_AsyncPayloadMailbox(), battle_done=asyncio.Event()
+    )
+    capacity_notifications = 0
+
+    def notify_capacity():
+        nonlocal capacity_notifications
+        capacity_notifications += 1
+
+    worker = object.__new__(_SharedLocalBattleStreamWorker)
+    worker._battle_states = {"battle-1": state}
+    worker._config = SimpleNamespace(max_battles_per_worker=1)
+    worker._capacity_available_callback = notify_capacity
+
+    result = await worker._handle_stdout_event(
+        {"type": "battle-ended", "battleId": "battle-1"}
+    )
+
+    assert result is None
+    assert state.active is False
+    assert state.battle_done.is_set()
+    assert worker.load == 0
+    assert worker.has_capacity
+    assert capacity_notifications == 1
+    assert await state.message_queue.get(timeout=0) is None
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_pool_acquire_wakes_on_capacity_notification():
+    class DummySharedWorker:
+        def __init__(self):
+            self.ready = False
+            self.allocated = False
+
+        @property
+        def has_capacity(self):
+            return self.ready
+
+        @property
+        def load(self):
+            return 0 if self.ready else 1
+
+        async def allocate_battle(self):
+            self.allocated = True
+            return "battle-handle"
+
+    worker = DummySharedWorker()
+    pool = object.__new__(_SharedLocalBattleStreamWorkerPool)
+    pool._workers = [worker]
+    pool._started = True
+    pool._start_lock = asyncio.Lock()
+    pool._available = asyncio.Condition()
+    pool._next_worker_index = 0
+
+    acquire_task = asyncio.create_task(pool.acquire())
+    await asyncio.sleep(0)
+    assert not acquire_task.done()
+
+    worker.ready = True
+    pool._notify_capacity_available()
+
+    result = await asyncio.wait_for(acquire_task, timeout=1.0)
+    assert result == "battle-handle"
+    assert worker.allocated
+
+
+@pytest.mark.asyncio
+async def test_shared_worker_flushes_protocol_before_battle_ended():
+    state = _SharedBattleState(
+        message_queue=_AsyncPayloadMailbox(), battle_done=asyncio.Event()
+    )
+    worker = object.__new__(_SharedLocalBattleStreamWorker)
+    worker._battle_states = {"battle-1": state}
+
+    assert await worker._handle_stdout_events(
+        [
+            {
+                "type": "protocol-batch",
+                "battleId": "battle-1",
+                "messages": [
+                    {
+                        "type": "side-chunk",
+                        "player": "p1",
+                        "messages": [["", "win", "p1"]],
+                    }
+                ],
+            },
+            {"type": "battle-ended", "battleId": "battle-1"},
+        ]
+    )
+
+    assert await state.message_queue.get(timeout=0) == {
+        "type": "side-chunk",
+        "player": "p1",
+        "messages": [["", "win", "p1"]],
+    }
+    assert await state.message_queue.get(timeout=0) is None
 
 
 @pytest.mark.asyncio
@@ -637,7 +1645,7 @@ async def test_local_session_treats_win_message_as_terminal_without_stream_end()
                     "type": "split-chunk",
                     "p1_messages": [["", "turn", "2"], ["", "win", "Player 1"]],
                     "p2_messages": [["", "turn", "2"], ["", "win", "Player 1"]],
-                },
+                }
             ],
         }
     )
@@ -698,24 +1706,8 @@ async def test_local_session_drains_terminal_protocol_batch_for_both_players():
     assert finished is True
     assert session._accepting_player_messages is False
     await session._wait_for_dispatches()
-    assert session._client_1.messages == [
-        (
-            "battle-test",
-            [
-                ["", "request", "p1-choice"],
-                ["", "win", "Player 1"],
-            ],
-        )
-    ]
-    assert session._client_2.messages == [
-        (
-            "battle-test",
-            [
-                ["", "request", "p2-choice"],
-                ["", "win", "Player 1"],
-            ],
-        )
-    ]
+    assert session._client_1.messages == [("battle-test", [["", "win", "Player 1"]])]
+    assert session._client_2.messages == [("battle-test", [["", "win", "Player 1"]])]
 
 
 @pytest.mark.asyncio
@@ -753,24 +1745,70 @@ async def test_local_session_replays_global_terminal_result_to_missing_side():
     assert finished is True
     assert session._accepting_player_messages is False
     await session._wait_for_dispatches()
-    assert session._client_1.messages == [
-        (
-            "battle-test",
-            [
-                ["", "request", "p1-choice"],
-                ["", "win", "Player 1"],
+    assert session._client_1.messages == [("battle-test", [["", "win", "Player 1"]])]
+    assert session._client_2.messages == [("battle-test", [["", "win", "Player 1"]])]
+
+
+@pytest.mark.asyncio
+async def test_local_session_replays_end_event_winner_to_buffered_messages():
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = DummyClient()
+    session._client_2 = DummyClient()
+    session._accepting_player_messages = True
+
+    finished = await session._dispatch_protocol_payload(
+        {
+            "type": "protocol-batch",
+            "messages": [
+                {
+                    "type": "split-chunk",
+                    "p1_messages": [["", "turn", "9"]],
+                    "p2_messages": [["", "turn", "9"]],
+                },
+                {
+                    "type": "side-chunk",
+                    "player": "p1",
+                    "messages": [["", "request", "p1-choice"]],
+                },
+                {
+                    "type": "side-chunk",
+                    "player": "p2",
+                    "messages": [["", "request", "p2-choice"]],
+                },
+                {"type": "end", "payload": '{"winner":"Player 1"}'},
             ],
-        )
+        }
+    )
+
+    assert finished is True
+    assert session._accepting_player_messages is False
+    await session._wait_for_dispatches()
+    assert session._client_1.messages == [
+        ("battle-test", [["", "turn", "9"], ["", "win", "Player 1"]])
     ]
     assert session._client_2.messages == [
-        (
-            "battle-test",
-            [
-                ["", "request", "p2-choice"],
-                ["", "win", "Player 1"],
-            ],
-        )
+        ("battle-test", [["", "turn", "9"], ["", "win", "Player 1"]])
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_session_dispatches_standalone_end_event_winner():
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._client_1 = DummyClient()
+    session._client_2 = DummyClient()
+    session._accepting_player_messages = True
+
+    finished = await session._dispatch_protocol_message(
+        {"type": "end", "payload": '{"winner":"Player 2"}'}
+    )
+
+    assert finished is True
+    assert session._accepting_player_messages is False
+    await session._wait_for_dispatches()
+    assert session._client_1.messages == [("battle-test", [["", "win", "Player 2"]])]
+    assert session._client_2.messages == [("battle-test", [["", "win", "Player 2"]])]
 
 
 def test_cross_loop_local_controller_detects_terminal_protocol_batch():
@@ -830,3 +1868,396 @@ async def test_cross_loop_local_controller_batches_battle_line_writes():
     )
 
     assert runtime_controller.calls == [[">p1 move 1", ">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_flushes_battle_lines_on_runtime_loop():
+    class DummyRuntimeController:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+            self.loop_ids: list[int] = []
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            self.calls.append(list(lines))
+            self.loop_ids.append(id(asyncio.get_running_loop()))
+
+    runtime_controller = DummyRuntimeController()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=asyncio.get_running_loop(),
+        runtime_loop=POKE_LOOP,
+        runtime_timeout=1.0,
+    )
+
+    await asyncio.gather(
+        controller.send_battle_line(">p1 team 1234"),
+        controller.send_battle_line(">p2 team 5678"),
+    )
+
+    assert runtime_controller.calls == [[">p1 team 1234", ">p2 team 5678"]]
+    assert runtime_controller.loop_ids == [id(POKE_LOOP)]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_wakes_session_loop_for_threaded_flush():
+    class DummyRuntimeController:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            self.calls.append(list(lines))
+
+    runtime_controller = DummyRuntimeController()
+    session_loop = asyncio.get_running_loop()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=session_loop,
+        runtime_loop=POKE_LOOP,
+        runtime_timeout=1.0,
+    )
+
+    waiter = session_loop.create_future()
+    controller._pending_battle_lines.append(">p1 team 1234")
+    controller._pending_battle_line_waiters.append(waiter)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        await session_loop.run_in_executor(
+            executor, controller._schedule_battle_line_flush
+        )
+
+    await asyncio.wait_for(waiter, timeout=1.0)
+
+    assert runtime_controller.calls == [[">p1 team 1234"]]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_serializes_in_flight_and_pending_writes():
+    first_started = ConcurrentFuture()
+    release_first = ConcurrentFuture()
+
+    class DummyRuntimeController:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            self.calls.append(list(lines))
+            if len(self.calls) == 1:
+                first_started.set_result(None)
+                await asyncio.wrap_future(release_first)
+
+        async def describe(self) -> str:
+            return f"runtime_call_count={len(self.calls)}"
+
+    runtime_controller = DummyRuntimeController()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=asyncio.get_running_loop(),
+        runtime_loop=POKE_LOOP,
+        runtime_timeout=1.0,
+    )
+
+    first_write = asyncio.create_task(controller.send_battle_line(">p1 move 1"))
+    await asyncio.wait_for(asyncio.wrap_future(first_started), timeout=0.2)
+
+    second_write = asyncio.create_task(controller.send_battle_line(">p2 move 2"))
+    await asyncio.sleep(0)
+
+    description = await controller.describe()
+    assert "pending_writes=1" in description
+    assert "write_in_flight=True" in description
+    assert "in_flight_write_count=1" in description
+    assert ">p1 move 1" not in description
+    assert not first_write.done()
+    assert not second_write.done()
+
+    release_first.set_result(None)
+    await asyncio.gather(first_write, second_write)
+
+    assert runtime_controller.calls == [[">p1 move 1"], [">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_propagates_runtime_write_failure():
+    class DummyRuntimeController:
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            del lines
+            raise ShowdownException("runtime write failed")
+
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=DummyRuntimeController(),
+        session_loop=asyncio.get_running_loop(),
+        runtime_loop=POKE_LOOP,
+        runtime_timeout=1.0,
+    )
+
+    with pytest.raises(ShowdownException, match="runtime write failed"):
+        await controller.send_battle_line(">p1 move 1")
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_fails_pending_writes_after_runtime_failure():
+    first_started = ConcurrentFuture()
+    release_first = ConcurrentFuture()
+
+    class DummyRuntimeController:
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            del lines
+            if not first_started.done():
+                first_started.set_result(None)
+            await asyncio.wrap_future(release_first)
+            raise ShowdownException("runtime write failed")
+
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=DummyRuntimeController(),
+        session_loop=asyncio.get_running_loop(),
+        runtime_loop=POKE_LOOP,
+        runtime_timeout=1.0,
+    )
+
+    first_write = asyncio.create_task(controller.send_battle_line(">p1 move 1"))
+    await asyncio.wait_for(asyncio.wrap_future(first_started), timeout=0.2)
+
+    second_write = asyncio.create_task(controller.send_battle_line(">p2 move 2"))
+    await asyncio.sleep(0)
+    release_first.set_result(None)
+
+    results = await asyncio.gather(first_write, second_write, return_exceptions=True)
+    assert len(results) == 2
+    for result in results:
+        assert isinstance(result, ShowdownException)
+        assert "runtime write failed" in str(result)
+
+
+@pytest.mark.asyncio
+async def test_runtime_shard_cancelled_acquire_releases_reservation():
+    shard = object.__new__(_LocalRuntimeShard)
+    shard._load = 0
+    shard._load_lock = Lock()
+    acquire_started = asyncio.Event()
+    wait_forever = asyncio.Event()
+
+    async def acquire():
+        acquire_started.set()
+        await wait_forever.wait()
+
+    async def run(coroutine):
+        return await coroutine
+
+    shard._acquire = acquire
+    shard._run = run
+
+    acquire_task = asyncio.create_task(shard.acquire())
+    await acquire_started.wait()
+    assert shard.load == 1
+
+    acquire_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquire_task
+
+    assert shard.load == 0
+
+
+@pytest.mark.asyncio
+async def test_local_session_cancelled_close_still_releases_worker_and_detaches_clients():
+    events = []
+
+    class CancellingWorker:
+        async def close_battle(self):
+            events.append("close")
+            raise asyncio.CancelledError
+
+    class RecordingPool:
+        async def release(self, worker):
+            events.append(("release", worker))
+
+    session = object.__new__(LocalBattleStreamSession)
+    session._battle_started = False
+    session._accepting_player_messages = True
+    session._worker = CancellingWorker()
+    session._pool = RecordingPool()
+    session._detach_clients = lambda: events.append("detach")
+    worker = session._worker
+
+    with pytest.raises(asyncio.CancelledError):
+        await session._finalize_battle()
+
+    assert events == ["close", ("release", worker), "detach"]
+    assert session._worker is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "worker_count",
+        "max_battles_per_worker",
+        "player_1_limit",
+        "player_2_limit",
+        "n_battles",
+        "expected_concurrency",
+    ),
+    [(2, 3, 4, 5, 10, 4), (2, 3, 0, 0, 10, 6), (3, 2, 0, 2, 10, 2), (4, 2, 0, 0, 3, 3)],
+)
+async def test_run_local_battles_respects_player_and_pool_limits(
+    monkeypatch,
+    tmp_path,
+    worker_count,
+    max_battles_per_worker,
+    player_1_limit,
+    player_2_limit,
+    n_battles,
+    expected_concurrency,
+):
+    config = LocalBattleStreamConfiguration(
+        tmp_path,
+        worker_count=worker_count,
+        max_battles_per_worker=max_battles_per_worker,
+    )
+    player_1, player_2 = _local_runner_players(
+        monkeypatch, config, player_1_limit, player_2_limit
+    )
+    battle_ids = []
+    active = 0
+    max_active = 0
+
+    class RecordingSession:
+        def __init__(self, player_1, player_2, battle_index):
+            del player_1, player_2
+            self.battle_index = battle_index
+            battle_ids.append(battle_index)
+
+        async def run(self):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0)
+            finally:
+                active -= 1
+
+    monkeypatch.setattr(
+        local_client_module, "LocalBattleStreamSession", RecordingSession
+    )
+
+    await run_local_battles(player_1, player_2, n_battles)
+
+    assert max_active == expected_concurrency
+    assert active == 0
+    assert len(battle_ids) == n_battles
+    assert len(set(battle_ids)) == n_battles
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n_battles", [0, -2])
+async def test_run_local_battles_non_positive_count_is_a_no_op(
+    monkeypatch, tmp_path, n_battles
+):
+    config = LocalBattleStreamConfiguration(tmp_path)
+    player_1, player_2 = _local_runner_players(monkeypatch, config, 0, 0)
+
+    class UnexpectedSession:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                "A non-positive battle count must not create a session"
+            )
+
+    monkeypatch.setattr(
+        local_client_module, "LocalBattleStreamSession", UnexpectedSession
+    )
+
+    await run_local_battles(player_1, player_2, n_battles)
+
+
+@pytest.mark.asyncio
+async def test_run_local_battles_cancels_and_drains_siblings_after_failure(
+    monkeypatch, tmp_path
+):
+    config = LocalBattleStreamConfiguration(tmp_path, worker_count=3)
+    player_1, player_2 = _local_runner_players(monkeypatch, config, 0, 0)
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    started = set()
+    cancelled = set()
+    cleaned = set()
+    active = 0
+
+    class FailingSession:
+        def __init__(self, player_1, player_2, battle_index):
+            del player_1, player_2, battle_index
+            self.ordinal = len(started)
+
+        async def run(self):
+            nonlocal active
+            active += 1
+            started.add(self.ordinal)
+            if len(started) == 3:
+                all_started.set()
+            try:
+                await all_started.wait()
+                if self.ordinal == 0:
+                    raise RuntimeError("session failed")
+                await never.wait()
+            except asyncio.CancelledError:
+                cancelled.add(self.ordinal)
+                raise
+            finally:
+                active -= 1
+                cleaned.add(self.ordinal)
+
+    monkeypatch.setattr(local_client_module, "LocalBattleStreamSession", FailingSession)
+
+    with pytest.raises(RuntimeError, match="session failed"):
+        await run_local_battles(player_1, player_2, 10)
+
+    assert started == {0, 1, 2}
+    assert cancelled == {1, 2}
+    assert cleaned == started
+    assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_run_local_battles_caller_cancellation_drains_sessions(
+    monkeypatch, tmp_path
+):
+    config = LocalBattleStreamConfiguration(tmp_path, worker_count=3)
+    player_1, player_2 = _local_runner_players(monkeypatch, config, 0, 0)
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    started = set()
+    cancelled = set()
+    cleaned = set()
+    active = 0
+
+    class BlockingSession:
+        def __init__(self, player_1, player_2, battle_index):
+            del player_1, player_2, battle_index
+            self.ordinal = len(started)
+
+        async def run(self):
+            nonlocal active
+            active += 1
+            started.add(self.ordinal)
+            if len(started) == 3:
+                all_started.set()
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                cancelled.add(self.ordinal)
+                raise
+            finally:
+                active -= 1
+                cleaned.add(self.ordinal)
+
+    monkeypatch.setattr(
+        local_client_module, "LocalBattleStreamSession", BlockingSession
+    )
+    run_task = asyncio.create_task(run_local_battles(player_1, player_2, 10))
+    await asyncio.wait_for(all_started.wait(), timeout=1.0)
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert started == {0, 1, 2}
+    assert cancelled == started
+    assert cleaned == started
+    assert active == 0

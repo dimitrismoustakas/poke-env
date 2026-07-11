@@ -4,7 +4,6 @@ const {execSync} = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
-const {Worker} = require('worker_threads');
 
 function formatError(error) {
     if (error && typeof error.stack === 'string') {
@@ -94,10 +93,6 @@ function queueEvent(event) {
     }
 }
 
-function queueProtocolMessage(battleId, message) {
-    queueEvent({type: 'protocol-batch', battleId, messages: [message]});
-}
-
 async function flushEvents() {
     while (pendingEvents.length > 0 || flushScheduled) {
         if (flushScheduled && flushPromise) {
@@ -130,119 +125,172 @@ function validateLines(lines, commandType) {
     }
 }
 
+function splitProtocolMessages(lines) {
+    return lines.map(line => line.split('|'));
+}
+
+function writeBattleCommandLines(stream, lines) {
+    if (lines.length > 0) {
+        stream.write(lines.join('\n'));
+    }
+}
+
 const showdownDir = process.argv[2];
 if (!showdownDir) {
     throw new Error('Expected showdown_dir as the first argument.');
 }
 
+const maxActiveBattlesRaw = Number.parseInt(process.argv[3] || '0', 10);
+const maxActiveBattles = Number.isFinite(maxActiveBattlesRaw) && maxActiveBattlesRaw > 0 ? maxActiveBattlesRaw : 0;
+
 ensureBuilt(showdownDir);
 
+const {BattleStream} = require(path.join(showdownDir, 'dist', 'sim', 'battle-stream.js'));
+const {extractChannelMessages} = require(path.join(showdownDir, 'dist', 'sim', 'battle.js'));
+
 const activeStreams = new Map();
-const idleBattleWorkers = [];
-const allBattleWorkers = new Set();
 let closing = false;
 let shutdownStarted = false;
 
-function battleWorkerPath() {
-    return path.join(__dirname, 'battle_stream_battle_worker.js');
-}
-
-function removeIdleBattleWorker(handle) {
-    const index = idleBattleWorkers.indexOf(handle);
-    if (index >= 0) {
-        idleBattleWorkers.splice(index, 1);
+function queueProtocolMessages(battleId, messages) {
+    if (messages.length > 0) {
+        queueEvent({type: 'protocol-batch', battleId, messages});
     }
 }
 
-function createBattleWorker() {
-    const handle = {
-        worker: new Worker(battleWorkerPath(), {workerData: {showdownDir}}),
-        activeBattleId: null,
-        exited: false,
-    };
-    allBattleWorkers.add(handle);
-    handle.worker.on('message', event => handleBattleWorkerEvent(handle, event));
-    handle.worker.on('error', error => handleBattleWorkerError(handle, error));
-    handle.worker.on('exit', code => handleBattleWorkerExit(handle, code));
-    return handle;
+function queueBattleError(battleId, error) {
+    queueEvent({type: 'error', battleId, detail: formatError(error)});
 }
 
-function acquireBattleWorker() {
-    while (idleBattleWorkers.length > 0) {
-        const handle = idleBattleWorkers.pop();
-        if (!handle.exited) {
-            return handle;
-        }
-    }
-    return createBattleWorker();
-}
-
-function releaseBattleWorker(handle) {
-    if (!closing && !handle.exited) {
-        idleBattleWorkers.push(handle);
-    }
-}
-
-function handleBattleWorkerEvent(handle, event) {
-    if (!event || typeof event !== 'object') {
+function finishBattle(battleId, state) {
+    if (activeStreams.get(battleId) !== state) {
         return;
     }
-    if (event.type === 'ready') {
+    activeStreams.delete(battleId);
+    queueEvent({type: 'battle-ended', battleId});
+    if (closing && activeStreams.size === 0) {
+        void finishShutdown();
+    }
+}
+
+async function consumeBattle(battleId, state) {
+    const stream = state.stream;
+    try {
+        while (true) {
+            const chunk = await stream.read();
+            if (chunk === null) {
+                break;
+            }
+            const newlineIndex = chunk.indexOf('\n');
+            const chunkType = newlineIndex >= 0 ? chunk.slice(0, newlineIndex) : chunk;
+            const payload = newlineIndex >= 0 ? chunk.slice(newlineIndex + 1) : '';
+
+            switch (chunkType) {
+            case 'update': {
+                const channelMessages = extractChannelMessages(payload, [1, 2]);
+                queueProtocolMessages(battleId, [{
+                    type: 'split-chunk',
+                    p1_messages: splitProtocolMessages(channelMessages[1]),
+                    p2_messages: splitProtocolMessages(channelMessages[2]),
+                }]);
+                break;
+            }
+            case 'sideupdate': {
+                const sideBreak = payload.indexOf('\n');
+                const player = sideBreak >= 0 ? payload.slice(0, sideBreak) : payload;
+                const sidePayload = sideBreak >= 0 ? payload.slice(sideBreak + 1) : '';
+                queueProtocolMessages(battleId, [{
+                    type: 'side-chunk',
+                    player,
+                    messages: sidePayload ? splitProtocolMessages(sidePayload.split('\n')) : [],
+                }]);
+                break;
+            }
+            case 'end':
+                queueProtocolMessages(battleId, [{type: 'end', payload}]);
+                break;
+            case 'requesteddata':
+                break;
+            default:
+                queueProtocolMessages(battleId, [chunk]);
+                break;
+            }
+        }
+    } catch (error) {
+        if (activeStreams.get(battleId) === state) {
+            queueBattleError(battleId, error);
+        }
+    } finally {
+        finishBattle(battleId, state);
+    }
+}
+
+function startBattle(battleId, lines) {
+    if (!battleId || typeof battleId !== 'string') {
+        throw new Error('start command requires a string battleId.');
+    }
+    if (activeStreams.has(battleId)) {
+        throw new Error(`Cannot start battle ${battleId} while it is already active.`);
+    }
+    if (maxActiveBattles > 0 && activeStreams.size >= maxActiveBattles) {
+        throw new Error(
+            `Cannot start battle ${battleId}; worker is at capacity ${maxActiveBattles}.`,
+        );
+    }
+
+    validateLines(lines, 'start');
+    const stream = new BattleStream({noCatch: true});
+    const state = {stream};
+    activeStreams.set(battleId, state);
+    void consumeBattle(battleId, state);
+
+    try {
+        writeBattleCommandLines(stream, lines);
+    } catch (error) {
+        queueBattleError(battleId, error);
+        closeBattle(battleId);
+        return;
+    }
+    queueEvent({type: 'battle-started', battleId});
+}
+
+function writeBattleLines(battleId, lines) {
+    const state = activeStreams.get(battleId);
+    if (!state) {
+        queueBattleError(
+            battleId,
+            new Error(`Received a write command without an active battle: ${battleId}`),
+        );
         return;
     }
 
-    const battleId = handle.activeBattleId;
-    if (!battleId) {
-        if (event.type === 'error') {
-            queueEvent({type: 'error', detail: event.detail || 'Idle battle worker failed'});
-        }
+    validateLines(lines, 'write');
+    try {
+        writeBattleCommandLines(state.stream, lines);
+    } catch (error) {
+        queueBattleError(battleId, error);
+        closeBattle(battleId);
         return;
     }
+}
 
-    if (event.type === 'battle-ended') {
-        if (activeStreams.get(battleId) === handle) {
-            activeStreams.delete(battleId);
-        }
-        handle.activeBattleId = null;
+function closeBattle(battleId) {
+    const state = activeStreams.get(battleId);
+    if (!state) {
         queueEvent({type: 'battle-ended', battleId});
-        releaseBattleWorker(handle);
         if (closing && activeStreams.size === 0) {
             void finishShutdown();
         }
         return;
     }
 
-    event.battleId = battleId;
-    queueEvent(event);
-}
-
-function handleBattleWorkerError(handle, error) {
-    const battleId = handle.activeBattleId;
-    if (battleId && activeStreams.get(battleId) === handle) {
-        queueEvent({type: 'error', battleId, detail: formatError(error)});
-    } else {
-        queueEvent({type: 'error', detail: formatError(error)});
+    activeStreams.delete(battleId);
+    try {
+        state.stream.destroy();
+    } catch (error) {
+        queueBattleError(battleId, error);
     }
-}
-
-function handleBattleWorkerExit(handle, code) {
-    handle.exited = true;
-    allBattleWorkers.delete(handle);
-    removeIdleBattleWorker(handle);
-
-    const battleId = handle.activeBattleId;
-    handle.activeBattleId = null;
-    if (battleId && activeStreams.get(battleId) === handle) {
-        activeStreams.delete(battleId);
-        if (code !== 0) {
-            queueEvent({
-                type: 'error',
-                battleId,
-                detail: `Battle worker thread exited with code ${code}`,
-            });
-        }
-        queueEvent({type: 'battle-ended', battleId});
-    }
+    queueEvent({type: 'battle-ended', battleId});
     if (closing && activeStreams.size === 0) {
         void finishShutdown();
     }
@@ -253,55 +301,14 @@ async function finishShutdown() {
         return;
     }
     shutdownStarted = true;
-    const terminations = [];
-    for (const handle of allBattleWorkers) {
-        terminations.push(handle.worker.terminate());
+    for (const battleId of Array.from(activeStreams.keys())) {
+        closeBattle(battleId);
     }
-    await Promise.allSettled(terminations);
     await flushEvents();
     process.exit(0);
 }
 
-function startBattle(battleId, lines) {
-    if (!battleId || typeof battleId !== 'string') {
-        throw new Error('start command requires a string battleId.');
-    }
-    if (activeStreams.has(battleId)) {
-        throw new Error(`Cannot start battle ${battleId} while it is already active.`);
-    }
-
-    validateLines(lines, 'start');
-    const handle = acquireBattleWorker();
-    handle.activeBattleId = battleId;
-    activeStreams.set(battleId, handle);
-    handle.worker.postMessage({type: 'start', lines});
-}
-
-function writeBattleLines(battleId, lines) {
-    const handle = activeStreams.get(battleId);
-    if (!handle) {
-        queueEvent({
-            type: 'error',
-            battleId,
-            detail: formatError(new Error(`Received a write command without an active battle: ${battleId}`)),
-        });
-        return;
-    }
-
-    validateLines(lines, 'write');
-    handle.worker.postMessage({type: 'write', lines});
-}
-
-function closeBattle(battleId) {
-    const handle = activeStreams.get(battleId);
-    if (handle) {
-        handle.worker.postMessage({type: 'close-battle'});
-    } else {
-        queueEvent({type: 'battle-ended', battleId});
-    }
-}
-
-function handleCommand(command) {
+async function handleCommand(command) {
     switch (command.type) {
     case 'start':
         startBattle(command.battleId, command.lines);
@@ -333,17 +340,23 @@ async function failWorker(error) {
     process.exit(1);
 }
 
+let commandChain = Promise.resolve();
+
 function enqueueCommand(rawLine) {
     if (!rawLine.trim()) {
         return;
     }
 
+    let command;
     try {
-        const command = JSON.parse(rawLine);
-        handleCommand(command);
+        command = JSON.parse(rawLine);
     } catch (error) {
         void failWorker(error);
+        return;
     }
+    commandChain = commandChain
+        .then(() => handleCommand(command))
+        .catch(error => failWorker(error));
 }
 
 process.stdin.setEncoding('utf8');

@@ -115,6 +115,53 @@ Local Servers
 
 By default, ``Player`` instances use ``LocalhostServerConfiguration``, targeting the default local server endpoint.
 
+Direct Local BattleStreams
+--------------------------
+
+Self-play and training between two local agents can bypass the websocket
+server. ``LocalBattleStreamConfiguration`` starts Node workers against an
+installed Pokemon Showdown checkout and communicates with BattleStreams
+directly. Run ``npm install`` in that checkout first; no Showdown server process
+is needed.
+
+.. code-block:: python
+
+    import asyncio
+    from pathlib import Path
+
+    from poke_env import LocalBattleStreamConfiguration
+    from poke_env.player import RandomPlayer
+
+
+    async def main():
+        config = LocalBattleStreamConfiguration(
+            showdown_dir=Path("../pokemon-showdown"),
+            worker_count=2,
+            max_battles_per_worker=2,
+        )
+        player = RandomPlayer(
+            server_configuration=config,
+            max_concurrent_battles=4,
+        )
+        opponent = RandomPlayer(
+            server_configuration=config,
+            max_concurrent_battles=4,
+        )
+
+        try:
+            await player.battle_against(opponent, n_battles=20)
+        finally:
+            await player.ps_client.stop_listening()
+            await opponent.ps_client.stop_listening()
+
+
+    asyncio.run(main())
+
+Both players must use the same local configuration, event loop, and battle
+format. The number of concurrent battles is bounded by the worker capacity and
+both players' ``max_concurrent_battles`` values. Ladder searches and mixed
+local/websocket battles are not supported by this backend.
+
 Official Showdown Server
 ------------------------
 

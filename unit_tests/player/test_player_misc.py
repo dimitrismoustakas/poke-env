@@ -369,6 +369,21 @@ def _add_finished_battle(player: Player, suffix: int) -> Battle:
 
 
 @pytest.mark.parametrize("value", [-1, 1.5, "1", True, None])
+def test_max_concurrent_battles_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        SimplePlayer(start_listening=False, max_concurrent_battles=value)
+
+
+@pytest.mark.parametrize("value", [0, 1, 4])
+def test_max_concurrent_battles_is_read_only(value):
+    player = SimplePlayer(start_listening=False, max_concurrent_battles=value)
+
+    assert player.max_concurrent_battles == value
+    with pytest.raises(AttributeError):
+        player.max_concurrent_battles = value + 1
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, "1", True, None])
 def test_max_finished_battles_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="must be a non-negative integer"):
         SimplePlayer(start_listening=False, max_finished_battles=value)
