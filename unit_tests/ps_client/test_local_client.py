@@ -20,7 +20,6 @@ from poke_env.ps_client.local_client import (
     _expand_worker_events,
     _get_or_create_worker_pool,
     _LocalRuntimeShard,
-    _payload_has_terminal_battle_message,
     _protocol_batch_payload,
     _SharedBattleState,
     _SharedLocalBattleStreamWorker,
@@ -64,6 +63,55 @@ class DummyClient:
         self, room: str, payload: str | list[str] | list[list[str]]
     ) -> None:
         self.messages.append((room, payload))
+
+
+def _protocol_read_session(worker) -> LocalBattleStreamSession:
+    session = object.__new__(LocalBattleStreamSession)
+    session._worker = worker
+    session._dispatch_tails = {}
+    session._dispatch_tasks = set()
+    session._dispatch_failure = asyncio.get_running_loop().create_future()
+    return session
+
+
+def _legacy_payload_to_split_messages(payload):
+    if not payload:
+        return []
+    if isinstance(payload, str):
+        return [line.split("|") for line in payload.split("\n")]
+    if payload and isinstance(payload[0], list):
+        return payload
+    return [str(line).split("|") for line in payload]
+
+
+def _legacy_payload_has_actionable_request(payload):
+    for split_message in _legacy_payload_to_split_messages(payload):
+        if len(split_message) <= 2 or split_message[1] != "request":
+            continue
+        if not split_message[2]:
+            continue
+        try:
+            request = local_client_module.orjson.loads(split_message[2])
+        except local_client_module.orjson.JSONDecodeError:
+            return False
+        if not request.get("wait", False):
+            return True
+    return False
+
+
+def _legacy_payload_requires_dispatch_barrier(payload):
+    return any(
+        len(split_message) > 1
+        and split_message[1] in {"showteam", "error", "win", "tie", "deinit"}
+        for split_message in _legacy_payload_to_split_messages(payload)
+    )
+
+
+def _legacy_payload_terminal_message(payload):
+    for split_message in _legacy_payload_to_split_messages(payload):
+        if len(split_message) > 1 and split_message[1] in {"win", "tie"}:
+            return split_message
+    return None
 
 
 def _local_runner_players(
@@ -162,8 +210,8 @@ def test_protocol_batch_payload_flattens_nested_worker_batches():
         [["", "tie"]],
     ],
 )
-def test_payload_has_terminal_battle_message(payload):
-    assert _payload_has_terminal_battle_message(payload)
+def test_classify_payload_finds_terminal_battle_message(payload):
+    assert local_client_module._classify_payload(payload).terminal_message is not None
 
 
 @pytest.mark.asyncio
@@ -293,6 +341,54 @@ def test_translate_showdown_command(message, expected):
 def test_translate_showdown_command_rejects_unknown_messages():
     with pytest.raises(ShowdownException, match="Unsupported message"):
         _translate_showdown_command("/challenge someone, gen9randombattle")
+
+
+@pytest.mark.parametrize("payload_form", ["split", "lines", "text"])
+@pytest.mark.parametrize(
+    "split_messages",
+    [
+        [],
+        [["", "turn", "1"]],
+        [["", "request", '{"wait":true}']],
+        [["", "request", '{"active":[{}]}']],
+        [["", "request", '{"wait":true}'], ["", "request", '{"active":[{}]}']],
+        [["", "request", "{"], ["", "request", '{"active":[{}]}']],
+        [["", "request", '{"active":[{}]}'], ["", "request", "{"]],
+        [["", "request", ""], ["", "request", '{"active":[{}]}']],
+        [["", "showteam", "p1", "team"], ["", "request", '{"wait":true}']],
+        [["", "error", "bad choice"], ["", "request", '{"active":[{}]}']],
+        [["", "request", "{"], ["", "win", "Player 1"]],
+        [["", "request", '{"active":[{}]}'], ["", "tie"]],
+        [["", "deinit"]],
+        [["", "request", "[]"]],
+        [["", "request", "null"]],
+        [["", "request", '{"wait":1}']],
+        [["", "request", '{"wait":0}']],
+    ],
+)
+def test_payload_metadata_matches_legacy_classification(payload_form, split_messages):
+    if payload_form == "split":
+        payload = [list(message) for message in split_messages]
+    else:
+        lines = ["|".join(message) for message in split_messages]
+        payload = lines if payload_form == "lines" else "\n".join(lines)
+
+    metadata = local_client_module._classify_payload(payload)
+    expected_terminal = _legacy_payload_terminal_message(payload)
+    expected_barrier = _legacy_payload_requires_dispatch_barrier(payload)
+
+    assert metadata.actionable_request is None
+    assert metadata.terminal_message == expected_terminal
+    assert metadata.requires_dispatch_barrier is expected_barrier
+
+    try:
+        expected_actionable = _legacy_payload_has_actionable_request(payload)
+    except AttributeError:
+        with pytest.raises(AttributeError):
+            local_client_module._resolve_actionable_request(metadata)
+    else:
+        resolved = local_client_module._resolve_actionable_request(metadata)
+        assert resolved.actionable_request is expected_actionable
 
 
 def test_get_or_create_worker_pool_is_thread_safe():
@@ -957,6 +1053,198 @@ async def test_local_session_startup_timeout_reports_worker_diagnostics():
 
 
 @pytest.mark.asyncio
+async def test_local_session_protocol_read_fast_path_after_completed_dispatch(
+    monkeypatch,
+):
+    class RecordingWorker:
+        def __init__(self):
+            self.timeouts = []
+
+        async def read_protocol_message(self, timeout):
+            self.timeouts.append(timeout)
+            return "payload"
+
+    async def completed_dispatch():
+        return None
+
+    worker = RecordingWorker()
+    session = _protocol_read_session(worker)
+    dispatch_task = asyncio.create_task(completed_dispatch())
+    await dispatch_task
+    session._dispatch_tasks.add(dispatch_task)
+
+    async def unexpected_wait(*args, **kwargs):
+        raise AssertionError("Completed dispatches should use the direct read path")
+
+    monkeypatch.setattr(asyncio, "wait", unexpected_wait)
+
+    assert await session._read_protocol_message(1.25) == "payload"
+    assert worker.timeouts == [1.25]
+
+
+@pytest.mark.asyncio
+async def test_local_session_protocol_read_fast_path_propagates_completed_failure():
+    class UnexpectedWorker:
+        def __init__(self):
+            self.calls = 0
+
+        async def read_protocol_message(self, timeout):
+            self.calls += 1
+            raise AssertionError("A failed dispatch must prevent the worker read")
+
+    error = RuntimeError("dispatch failed")
+
+    async def failed_dispatch():
+        raise error
+
+    worker = UnexpectedWorker()
+    session = _protocol_read_session(worker)
+    dispatch_task = asyncio.create_task(failed_dispatch())
+    await asyncio.gather(dispatch_task, return_exceptions=True)
+    session._dispatch_tasks.add(dispatch_task)
+
+    with pytest.raises(RuntimeError, match="dispatch failed") as exc_info:
+        await session._read_protocol_message(None)
+
+    assert exc_info.value is error
+    assert worker.calls == 0
+    assert session._dispatch_failure.exception() is error
+
+
+@pytest.mark.asyncio
+async def test_local_session_protocol_read_races_pending_dispatch_failure():
+    dispatch_release = asyncio.Event()
+    read_started = asyncio.Event()
+    read_cancelled = asyncio.Event()
+    never = asyncio.Event()
+    error = RuntimeError("pending dispatch failed")
+
+    class BlockingWorker:
+        async def read_protocol_message(self, timeout):
+            read_started.set()
+            try:
+                await never.wait()
+            finally:
+                read_cancelled.set()
+
+    async def failed_dispatch():
+        await dispatch_release.wait()
+        raise error
+
+    session = _protocol_read_session(BlockingWorker())
+    dispatch_task = asyncio.create_task(failed_dispatch())
+    session._track_dispatch_task(dispatch_task)
+    protocol_read = asyncio.create_task(session._read_protocol_message(None))
+    await asyncio.wait_for(read_started.wait(), timeout=0.2)
+
+    dispatch_release.set()
+    with pytest.raises(RuntimeError, match="pending dispatch failed") as exc_info:
+        await asyncio.wait_for(protocol_read, timeout=0.2)
+
+    assert exc_info.value is error
+    assert read_cancelled.is_set()
+    assert session._dispatch_failure.exception() is error
+
+
+@pytest.mark.asyncio
+async def test_local_session_protocol_read_does_not_wait_for_pending_dispatch():
+    dispatch_release = asyncio.Event()
+    read_started = asyncio.Event()
+    payload_ready = asyncio.Event()
+
+    class BlockingWorker:
+        async def read_protocol_message(self, timeout):
+            read_started.set()
+            await payload_ready.wait()
+            return "payload"
+
+    session = _protocol_read_session(BlockingWorker())
+    dispatch_task = asyncio.create_task(dispatch_release.wait())
+    session._track_dispatch_task(dispatch_task)
+    protocol_read = asyncio.create_task(session._read_protocol_message(None))
+    await asyncio.wait_for(read_started.wait(), timeout=0.2)
+
+    payload_ready.set()
+    assert await asyncio.wait_for(protocol_read, timeout=0.2) == "payload"
+    assert not dispatch_task.done()
+
+    dispatch_release.set()
+    await dispatch_task
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_local_session_protocol_read_prefers_failure_when_read_also_completes():
+    read_started = asyncio.Event()
+    payload = asyncio.get_running_loop().create_future()
+    pending_dispatch = asyncio.create_task(asyncio.Event().wait())
+    error = RuntimeError("dispatch won race")
+
+    class RacingWorker:
+        async def read_protocol_message(self, timeout):
+            read_started.set()
+            return await payload
+
+    session = _protocol_read_session(RacingWorker())
+    session._dispatch_tasks.add(pending_dispatch)
+    protocol_read = asyncio.create_task(session._read_protocol_message(None))
+    await asyncio.wait_for(read_started.wait(), timeout=0.2)
+
+    session._dispatch_failure.set_exception(error)
+    payload.set_result("payload")
+    with pytest.raises(RuntimeError, match="dispatch won race") as exc_info:
+        await asyncio.wait_for(protocol_read, timeout=0.2)
+
+    assert exc_info.value is error
+    pending_dispatch.cancel()
+    await asyncio.gather(pending_dispatch, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_local_session_protocol_read_fast_path_propagates_timeout():
+    class TimeoutWorker:
+        def __init__(self):
+            self.timeouts = []
+
+        async def read_protocol_message(self, timeout):
+            self.timeouts.append(timeout)
+            raise asyncio.TimeoutError
+
+    worker = TimeoutWorker()
+    session = _protocol_read_session(worker)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await session._read_protocol_message(0.125)
+
+    assert worker.timeouts == [0.125]
+
+
+@pytest.mark.asyncio
+async def test_local_session_protocol_read_fast_path_propagates_cancellation():
+    read_started = asyncio.Event()
+    read_cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    class BlockingWorker:
+        async def read_protocol_message(self, timeout):
+            read_started.set()
+            try:
+                await never.wait()
+            finally:
+                read_cancelled.set()
+
+    session = _protocol_read_session(BlockingWorker())
+    protocol_read = asyncio.create_task(session._read_protocol_message(None))
+    await asyncio.wait_for(read_started.wait(), timeout=0.2)
+
+    protocol_read.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await protocol_read
+
+    assert read_cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_split_update_for_players_handles_empty_public_split_line():
     payload = "\n".join(
         ["|turn|1", "|split|p2", "|request|secret-p2", "", "|request|shared-followup"]
@@ -1150,6 +1438,181 @@ async def test_local_session_wait_request_dispatch_runs_without_reader_barrier()
 
     release.set()
     await session._wait_for_dispatches()
+
+
+@pytest.mark.asyncio
+async def test_local_session_classifies_each_actionable_side_once(monkeypatch):
+    class ChoosingClient:
+        def __init__(self, player, choice):
+            self.player = player
+            self.choice = choice
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            assert room == "battle-test"
+            await session.send_player_message(self.player, self.choice)
+
+    p1_request = '{"active":[{}],"side":{"id":"p1"}}'
+    p2_request = '{"active":[{}],"side":{"id":"p2"}}'
+    p1_payload = [["", "turn", "1"], ["", "request", p1_request]]
+    p2_payload = [["", "turn", "1"], ["", "request", p2_request]]
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ChoosingClient("p1", "/choose move 1")
+    session._client_2 = ChoosingClient("p2", "/choose move 2")
+
+    classified_payloads = []
+    parsed_requests = []
+    classify_payload = local_client_module._classify_payload
+    orjson_loads = local_client_module.orjson.loads
+
+    def counting_classify(payload):
+        classified_payloads.append(payload)
+        return classify_payload(payload)
+
+    def counting_loads(payload):
+        parsed_requests.append(payload)
+        return orjson_loads(payload)
+
+    monkeypatch.setattr(local_client_module, "_classify_payload", counting_classify)
+    monkeypatch.setattr(local_client_module.orjson, "loads", counting_loads)
+
+    finished = await session._dispatch_protocol_message(
+        {"type": "split-chunk", "p1_messages": p1_payload, "p2_messages": p2_payload}
+    )
+
+    assert finished is False
+    assert classified_payloads == [p1_payload, p2_payload]
+    assert parsed_requests == [p1_request, p2_request]
+    assert session._worker.line_batches == [[">p1 move 1", ">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_local_session_classifies_each_protocol_batch_fragment_once(monkeypatch):
+    class ChoosingClient:
+        def __init__(self, player, choice):
+            self.player = player
+            self.choice = choice
+
+        async def dispatch_room_message(self, room, payload) -> None:
+            await session.send_player_message(self.player, self.choice)
+
+    p1_request = '{"active":[{}],"side":{"id":"p1"}}'
+    p2_request = '{"active":[{}],"side":{"id":"p2"}}'
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = ChoosingClient("p1", "/choose move 1")
+    session._client_2 = ChoosingClient("p2", "/choose move 2")
+
+    classified_payloads = []
+    parsed_requests = []
+    classify_payload = local_client_module._classify_payload
+    orjson_loads = local_client_module.orjson.loads
+
+    def counting_classify(payload):
+        classified_payloads.append(payload)
+        return classify_payload(payload)
+
+    def counting_loads(payload):
+        parsed_requests.append(payload)
+        return orjson_loads(payload)
+
+    monkeypatch.setattr(local_client_module, "_classify_payload", counting_classify)
+    monkeypatch.setattr(local_client_module.orjson, "loads", counting_loads)
+
+    finished = await session._dispatch_protocol_batch(
+        [
+            {
+                "type": "split-chunk",
+                "p1_messages": [["", "turn", "1"]],
+                "p2_messages": [["", "turn", "1"]],
+            },
+            {
+                "type": "split-chunk",
+                "p1_messages": [["", "request", p1_request]],
+                "p2_messages": [["", "request", p2_request]],
+            },
+        ]
+    )
+
+    assert finished is False
+    assert classified_payloads == [
+        [["", "turn", "1"]],
+        [["", "turn", "1"]],
+        [["", "request", p1_request]],
+        [["", "request", p2_request]],
+    ]
+    assert parsed_requests == [p1_request, p2_request]
+    assert session._worker.line_batches == [[">p1 move 1", ">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_local_session_terminal_requests_are_dropped_without_json_parsing(
+    monkeypatch,
+):
+    p1_payload = [["", "request", "[]"], ["", "win", "Player 1"]]
+    p2_payload = [["", "request", "null"], ["", "win", "Player 1"]]
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = DummyClient()
+    session._client_2 = DummyClient()
+
+    def unexpected_loads(payload):
+        raise AssertionError(f"Terminal request was parsed: {payload}")
+
+    monkeypatch.setattr(local_client_module.orjson, "loads", unexpected_loads)
+
+    finished = await session._dispatch_protocol_message(
+        {"type": "split-chunk", "p1_messages": p1_payload, "p2_messages": p2_payload}
+    )
+
+    assert finished is True
+    assert session._client_1.messages == [("battle-test", [["", "win", "Player 1"]])]
+    assert session._client_2.messages == [("battle-test", [["", "win", "Player 1"]])]
+    assert session._worker.lines == []
+    assert session._worker.line_batches == []
+
+
+@pytest.mark.asyncio
+async def test_local_session_one_sided_terminal_preserves_other_action_request(
+    monkeypatch,
+):
+    class ChoosingClient:
+        async def dispatch_room_message(self, room, payload) -> None:
+            await session.send_player_message("p2", "/choose move 2")
+
+    p1_payload = [["", "request", "[]"], ["", "win", "Player 1"]]
+    p2_request = '{"active":[{}],"side":{"id":"p2"}}'
+    p2_payload = [["", "request", p2_request]]
+    session = object.__new__(LocalBattleStreamSession)
+    session._room = "battle-test"
+    session._worker = DummyWorker()
+    session._accepting_player_messages = True
+    session._client_1 = DummyClient()
+    session._client_2 = ChoosingClient()
+
+    parsed_requests = []
+    orjson_loads = local_client_module.orjson.loads
+
+    def counting_loads(payload):
+        parsed_requests.append(payload)
+        return orjson_loads(payload)
+
+    monkeypatch.setattr(local_client_module.orjson, "loads", counting_loads)
+
+    finished = await session._dispatch_protocol_message(
+        {"type": "split-chunk", "p1_messages": p1_payload, "p2_messages": p2_payload}
+    )
+
+    assert finished is True
+    assert parsed_requests == [p2_request]
+    assert session._client_1.messages == [("battle-test", [["", "win", "Player 1"]])]
+    assert session._worker.line_batches == [[">p2 move 2"]]
 
 
 @pytest.mark.asyncio
@@ -1868,6 +2331,245 @@ async def test_cross_loop_local_controller_batches_battle_line_writes():
     )
 
     assert runtime_controller.calls == [[">p1 move 1", ">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_submits_idle_multiline_batch_directly(
+    monkeypatch,
+):
+    class DummyRuntimeController:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            self.calls.append(list(lines))
+
+    runtime_controller = DummyRuntimeController()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=asyncio.get_running_loop(),
+        runtime_loop=asyncio.get_running_loop(),
+        runtime_timeout=1.0,
+    )
+
+    def unexpected_queue_flush() -> None:
+        raise AssertionError("Idle multiline batch used the queued flush path")
+
+    monkeypatch.setattr(
+        controller, "_schedule_battle_line_flush", unexpected_queue_flush
+    )
+
+    await controller.send_battle_lines([">p1 move 1", ">p2 move 2"])
+
+    assert runtime_controller.calls == [[">p1 move 1", ">p2 move 2"]]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_keeps_scheduled_multiline_batch_queued():
+    class DummyRuntimeController:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            self.calls.append(list(lines))
+
+    runtime_controller = DummyRuntimeController()
+    loop = asyncio.get_running_loop()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=loop,
+        runtime_loop=loop,
+        runtime_timeout=1.0,
+    )
+
+    await asyncio.gather(
+        controller.send_battle_line(">p1 team 1234"),
+        controller.send_battle_lines([">p2 team 5678", ">p2 move 2"]),
+    )
+
+    assert runtime_controller.calls == [
+        [">p1 team 1234", ">p2 team 5678", ">p2 move 2"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_serializes_direct_and_queued_batches():
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class DummyRuntimeController:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            self.calls.append(list(lines))
+            if len(self.calls) == 1:
+                first_started.set()
+                await release_first.wait()
+
+    runtime_controller = DummyRuntimeController()
+    loop = asyncio.get_running_loop()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=loop,
+        runtime_loop=loop,
+        runtime_timeout=1.0,
+    )
+
+    first_write = asyncio.create_task(
+        controller.send_battle_lines([">p1 move 1", ">p2 move 2"])
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
+
+    second_write = asyncio.create_task(
+        controller.send_battle_lines([">p1 move 3", ">p2 move 4"])
+    )
+    third_write = asyncio.create_task(controller.send_battle_line(">p1 move 5"))
+    await asyncio.sleep(0)
+
+    assert runtime_controller.calls == [[">p1 move 1", ">p2 move 2"]]
+    assert controller._pending_battle_lines == [
+        ">p1 move 3",
+        ">p2 move 4",
+        ">p1 move 5",
+    ]
+
+    release_first.set()
+    await asyncio.gather(first_write, second_write, third_write)
+
+    assert runtime_controller.calls == [
+        [">p1 move 1", ">p2 move 2"],
+        [">p1 move 3", ">p2 move 4", ">p1 move 5"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_direct_failure_fails_queued_batches():
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class DummyRuntimeController:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            self.calls.append(list(lines))
+            first_started.set()
+            await release_first.wait()
+            raise ShowdownException("direct runtime write failed")
+
+    runtime_controller = DummyRuntimeController()
+    loop = asyncio.get_running_loop()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=loop,
+        runtime_loop=loop,
+        runtime_timeout=1.0,
+    )
+
+    first_write = asyncio.create_task(
+        controller.send_battle_lines([">p1 move 1", ">p2 move 2"])
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
+    queued_write = asyncio.create_task(
+        controller.send_battle_lines([">p1 move 3", ">p2 move 4"])
+    )
+    await asyncio.sleep(0)
+    release_first.set()
+
+    results = await asyncio.gather(first_write, queued_write, return_exceptions=True)
+
+    assert runtime_controller.calls == [[">p1 move 1", ">p2 move 2"]]
+    assert len(results) == 2
+    for result in results:
+        assert isinstance(result, ShowdownException)
+        assert "direct runtime write failed" in str(result)
+    assert controller._battle_line_write_future is None
+    assert controller._pending_battle_lines == []
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_close_cancels_direct_write():
+    write_started = asyncio.Event()
+    write_cancelled = asyncio.Event()
+
+    class DummyRuntimeController:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def send_battle_lines(self, lines: list[str]) -> None:
+            del lines
+            write_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                write_cancelled.set()
+
+        async def close_battle(self) -> None:
+            self.close_calls += 1
+
+    runtime_controller = DummyRuntimeController()
+    loop = asyncio.get_running_loop()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=runtime_controller,
+        session_loop=loop,
+        runtime_loop=loop,
+        runtime_timeout=1.0,
+    )
+
+    write = asyncio.create_task(
+        controller.send_battle_lines([">p1 move 1", ">p2 move 2"])
+    )
+    await asyncio.wait_for(write_started.wait(), timeout=0.2)
+    await controller.close_battle()
+
+    with pytest.raises(
+        ShowdownException, match="closed before pending writes completed"
+    ):
+        await write
+    await asyncio.wait_for(write_cancelled.wait(), timeout=0.2)
+
+    assert runtime_controller.close_calls == 1
+    assert controller._battle_line_write_future is None
+    assert controller._battle_line_in_flight_lines == ()
+
+
+@pytest.mark.asyncio
+async def test_cross_loop_local_controller_close_wins_posted_completion_race(
+    monkeypatch,
+):
+    class DummyRuntimeController:
+        async def close_battle(self) -> None:
+            return None
+
+    loop = asyncio.get_running_loop()
+    controller = _CrossLoopLocalBattleController(
+        runtime_controller=DummyRuntimeController(),
+        session_loop=loop,
+        runtime_loop=loop,
+        runtime_timeout=1.0,
+    )
+    completed_future: ConcurrentFuture[None] = ConcurrentFuture()
+    completed_future.set_result(None)
+    monkeypatch.setattr(
+        controller, "_submit_battle_line_write", lambda lines: completed_future
+    )
+
+    write = asyncio.create_task(
+        controller.send_battle_lines([">p1 move 1", ">p2 move 2"])
+    )
+    close = asyncio.create_task(controller.close_battle())
+    write_result, close_result = await asyncio.gather(
+        write, close, return_exceptions=True
+    )
+    await asyncio.sleep(0)
+
+    assert isinstance(write_result, ShowdownException)
+    assert "closed before pending writes completed" in str(write_result)
+    assert close_result is None
+    assert controller._battle_line_write_future is None
+    assert controller._battle_line_in_flight_lines == ()
+    assert controller._battle_line_in_flight_waiters == []
 
 
 @pytest.mark.asyncio

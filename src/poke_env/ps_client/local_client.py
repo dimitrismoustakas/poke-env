@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import json
 from collections import deque
 from concurrent.futures import CancelledError as ConcurrentFutureCancelledError
 from concurrent.futures import Future
@@ -11,6 +10,8 @@ from itertools import count
 from pathlib import Path
 from threading import Lock, Thread, current_thread
 from typing import TYPE_CHECKING, Callable, Deque, NoReturn, Protocol, Sequence, cast
+
+import orjson
 
 from poke_env.concurrency import POKE_LOOP
 from poke_env.exceptions import ShowdownException
@@ -40,7 +41,7 @@ _STDERR_TAIL_LINES = 100
 
 
 def _json_dumps(payload: object) -> str:
-    return json.dumps(payload, separators=(",", ":"))
+    return orjson.dumps(payload).decode("utf-8")
 
 
 def _expand_worker_events(event: dict[str, object]) -> list[dict[str, object]]:
@@ -609,7 +610,7 @@ class _SharedLocalBattleStreamWorker:
                 if not line:
                     break
 
-                events = _expand_worker_events(json.loads(line))
+                events = _expand_worker_events(orjson.loads(line))
                 if not await self._handle_stdout_events(events):
                     return
         finally:
@@ -799,7 +800,9 @@ class _SharedLocalBattleStreamWorker:
         assert self._process.stdin is not None
 
         async with self._write_lock:
-            self._process.stdin.write((_json_dumps(command) + "\n").encode("utf-8"))
+            self._process.stdin.write(
+                orjson.dumps(command, option=orjson.OPT_APPEND_NEWLINE)
+            )
             await self._process.stdin.drain()
 
     def _battle_state(self, battle_id: str) -> _SharedBattleState:
@@ -990,10 +993,12 @@ class _CrossLoopLocalBattleController:
             raise ShowdownException("Cannot send to a closed local battle")
 
         waiter = self._session_loop.create_future()
-        self._pending_battle_lines.extend(lines)
-        self._pending_battle_line_waiters.append(waiter)
-
-        self._schedule_battle_line_flush()
+        if self._can_submit_battle_line_batch_directly(lines):
+            self._begin_battle_line_write(list(lines), [waiter])
+        else:
+            self._pending_battle_lines.extend(lines)
+            self._pending_battle_line_waiters.append(waiter)
+            self._schedule_battle_line_flush()
         await waiter
 
     async def read_protocol_message(self, timeout: float | None) -> object | None:
@@ -1053,6 +1058,18 @@ class _CrossLoopLocalBattleController:
             self._battle_line_flush_scheduled = False
             self._fail_all_battle_line_waiters(error)
 
+    def _can_submit_battle_line_batch_directly(self, lines: list[str]) -> bool:
+        return (
+            len(lines) > 1
+            and not self._closed
+            and not self._battle_line_flush_scheduled
+            and self._battle_line_write_future is None
+            and not self._pending_battle_lines
+            and not self._pending_battle_line_waiters
+            and not self._battle_line_in_flight_lines
+            and not self._battle_line_in_flight_waiters
+        )
+
     def _start_battle_line_flush(self) -> None:
         self._battle_line_flush_scheduled = False
         if (
@@ -1066,6 +1083,11 @@ class _CrossLoopLocalBattleController:
         waiters = self._pending_battle_line_waiters
         self._pending_battle_lines = []
         self._pending_battle_line_waiters = []
+        self._begin_battle_line_write(lines, waiters)
+
+    def _begin_battle_line_write(
+        self, lines: list[str], waiters: list[asyncio.Future[None]]
+    ) -> None:
         self._battle_line_in_flight_lines = tuple(lines)
         self._battle_line_in_flight_waiters = waiters
 
@@ -1646,51 +1668,104 @@ def _payload_to_split_messages(
     return [line.split("|") for line in str(payload).split("\n")]
 
 
-def _payload_has_terminal_battle_message(
-    payload: str | list[str] | list[list[str]] | object,
-) -> bool:
-    return _payload_terminal_battle_message(payload) is not None
+_TERMINAL_BATTLE_MESSAGE_TYPES = frozenset({"win", "tie"})
+_DISPATCH_BARRIER_MESSAGE_TYPES = frozenset(
+    {"showteam", "error", "win", "tie", "deinit"}
+)
 
 
-def _payload_has_actionable_request(
+@dataclass
+class _PayloadMetadata:
+    split_messages: list[list[str]]
+    request_payloads: list[str]
+    requires_dispatch_barrier: bool
+    terminal_message: list[str] | None
+    actionable_request: bool | None = None
+
+    @classmethod
+    def empty(cls) -> _PayloadMetadata:
+        return cls(
+            split_messages=[],
+            request_payloads=[],
+            requires_dispatch_barrier=False,
+            terminal_message=None,
+        )
+
+    def extend(self, addition: _PayloadMetadata) -> None:
+        self.split_messages.extend(addition.split_messages)
+        self.request_payloads.extend(addition.request_payloads)
+        self.requires_dispatch_barrier = (
+            self.requires_dispatch_barrier or addition.requires_dispatch_barrier
+        )
+        self.terminal_message = self.terminal_message or addition.terminal_message
+        self.actionable_request = None
+
+    def ensure_terminal_message(self, terminal_message: list[str] | None) -> None:
+        if terminal_message is None or self.terminal_message is not None:
+            return
+        terminal_message = list(terminal_message)
+        self.split_messages.append(terminal_message)
+        self.requires_dispatch_barrier = True
+        self.terminal_message = terminal_message
+
+
+def _classify_payload(
     payload: str | list[str] | list[list[str]] | object,
-) -> bool:
-    for split_message in _payload_to_split_messages(payload):
-        if len(split_message) <= 2 or split_message[1] != "request":
+) -> _PayloadMetadata:
+    split_messages = _payload_to_split_messages(payload)
+    request_payloads: list[str] = []
+    requires_dispatch_barrier = False
+    terminal_message: list[str] | None = None
+
+    for split_message in split_messages:
+        if len(split_message) <= 1:
             continue
-        if not split_message[2]:
-            continue
+        message_type = split_message[1]
+        if message_type in _DISPATCH_BARRIER_MESSAGE_TYPES:
+            requires_dispatch_barrier = True
+        if terminal_message is None and message_type in _TERMINAL_BATTLE_MESSAGE_TYPES:
+            terminal_message = split_message
+        if message_type == "request" and len(split_message) > 2 and split_message[2]:
+            request_payloads.append(split_message[2])
+
+    return _PayloadMetadata(
+        split_messages=split_messages,
+        request_payloads=request_payloads,
+        requires_dispatch_barrier=requires_dispatch_barrier,
+        terminal_message=terminal_message,
+    )
+
+
+def _resolve_actionable_request(metadata: _PayloadMetadata) -> _PayloadMetadata:
+    if metadata.actionable_request is not None:
+        return metadata
+
+    actionable_request = False
+    for request_payload in metadata.request_payloads:
         try:
-            request = json.loads(split_message[2])
-        except json.JSONDecodeError:
-            return False
+            request = orjson.loads(request_payload)
+        except orjson.JSONDecodeError:
+            break
         if not request.get("wait", False):
-            return True
-    return False
+            actionable_request = True
+            break
+
+    metadata.actionable_request = actionable_request
+    return metadata
 
 
-def _payload_requires_dispatch_barrier(
-    payload: str | list[str] | list[list[str]] | object,
+def _payloads_require_dispatch(
+    p1_metadata: _PayloadMetadata, p2_metadata: _PayloadMetadata
 ) -> bool:
-    for split_message in _payload_to_split_messages(payload):
-        if len(split_message) > 1 and split_message[1] in {
-            "showteam",
-            "error",
-            "win",
-            "tie",
-            "deinit",
-        }:
-            return True
-    return False
+    if p1_metadata.requires_dispatch_barrier or p2_metadata.requires_dispatch_barrier:
+        return True
 
+    _resolve_actionable_request(p1_metadata)
+    if p1_metadata.actionable_request:
+        return True
 
-def _payload_terminal_battle_message(
-    payload: str | list[str] | list[list[str]] | object,
-) -> list[str] | None:
-    for split_message in _payload_to_split_messages(payload):
-        if len(split_message) > 1 and split_message[1] in {"win", "tie"}:
-            return split_message
-    return None
+    _resolve_actionable_request(p2_metadata)
+    return bool(p2_metadata.actionable_request)
 
 
 def _terminal_battle_message_from_end_payload(payload: object) -> list[str] | None:
@@ -1701,8 +1776,8 @@ def _terminal_battle_message_from_end_payload(payload: object) -> list[str] | No
         if not payload:
             return None
         try:
-            payload = json.loads(payload)
-        except json.JSONDecodeError:
+            payload = orjson.loads(payload)
+        except orjson.JSONDecodeError:
             return None
 
     if not isinstance(payload, dict):
@@ -1716,25 +1791,21 @@ def _terminal_battle_message_from_end_payload(payload: object) -> list[str] | No
     return None
 
 
-def _ensure_terminal_battle_message(
-    payload: list[list[str]], terminal_message: list[str] | None
-) -> None:
-    if terminal_message is None or _payload_has_terminal_battle_message(payload):
-        return
-    payload.append(list(terminal_message))
-
-
-def _drop_terminal_action_requests(
-    payload: str | list[str] | list[list[str]],
+def _drop_terminal_action_requests_with_metadata(
+    payload: str | list[str] | list[list[str]], metadata: _PayloadMetadata
 ) -> str | list[str] | list[list[str]]:
-    if not _payload_has_terminal_battle_message(payload):
+    if metadata.terminal_message is None:
         return payload
 
-    return [
+    split_messages = [
         split_message
-        for split_message in _payload_to_split_messages(payload)
+        for split_message in metadata.split_messages
         if len(split_message) <= 1 or split_message[1] != "request"
     ]
+    metadata.split_messages = split_messages
+    metadata.request_payloads = []
+    metadata.actionable_request = False
+    return split_messages
 
 
 def _translate_showdown_command(message: str) -> tuple[str, str | None]:
@@ -2070,41 +2141,35 @@ class LocalBattleStreamSession:
         return await self._dispatch_protocol_message(message)
 
     async def _dispatch_protocol_batch(self, messages: list[object]) -> bool:
-        p1_messages: list[list[str]] = []
-        p2_messages: list[list[str]] = []
-        pending_terminal = False
+        p1_metadata = _PayloadMetadata.empty()
+        p2_metadata = _PayloadMetadata.empty()
         pending_terminal_message: list[str] | None = None
 
         async def flush_player_messages() -> bool:
-            nonlocal p1_messages, p2_messages, pending_terminal, pending_terminal_message
-            if p1_messages or p2_messages:
-                if pending_terminal:
-                    terminal_message = (
-                        pending_terminal_message
-                        or _payload_terminal_battle_message(p1_messages)
-                        or _payload_terminal_battle_message(p2_messages)
-                    )
-                    _ensure_terminal_battle_message(p1_messages, terminal_message)
-                    _ensure_terminal_battle_message(p2_messages, terminal_message)
-                wait_for_dispatch = (
-                    pending_terminal
-                    or _payload_requires_dispatch_barrier(p1_messages)
-                    or _payload_requires_dispatch_barrier(p2_messages)
-                    or _payload_has_actionable_request(p1_messages)
-                    or _payload_has_actionable_request(p2_messages)
+            nonlocal p1_metadata, p2_metadata, pending_terminal_message
+            if p1_metadata.split_messages or p2_metadata.split_messages:
+                terminal_message = (
+                    pending_terminal_message
+                    or p1_metadata.terminal_message
+                    or p2_metadata.terminal_message
                 )
+                terminal = terminal_message is not None
+                p1_metadata.ensure_terminal_message(terminal_message)
+                p2_metadata.ensure_terminal_message(terminal_message)
+                wait_for_dispatch = _payloads_require_dispatch(p1_metadata, p2_metadata)
+                wait_for_dispatch = terminal or wait_for_dispatch
                 terminal = await self._dispatch_player_payloads(
-                    p1_messages,
-                    p2_messages,
-                    terminal=pending_terminal,
+                    p1_metadata.split_messages,
+                    p2_metadata.split_messages,
+                    terminal=terminal,
                     wait_for_dispatch=wait_for_dispatch,
+                    p1_metadata=p1_metadata,
+                    p2_metadata=p2_metadata,
                 )
-                p1_messages = []
-                p2_messages = []
-                pending_terminal = False
+                p1_metadata = _PayloadMetadata.empty()
+                p2_metadata = _PayloadMetadata.empty()
                 pending_terminal_message = None
                 return terminal
-            pending_terminal = False
             pending_terminal_message = None
             return False
 
@@ -2129,16 +2194,14 @@ class LocalBattleStreamSession:
                 p2_payload = child_message.get("p2_messages") or str(
                     child_message.get("p2_payload", "")
                 )
-                p1_messages.extend(_payload_to_split_messages(p1_payload))
-                p2_messages.extend(_payload_to_split_messages(p2_payload))
-                terminal_message = _payload_terminal_battle_message(
-                    p1_payload
-                ) or _payload_terminal_battle_message(p2_payload)
-                if terminal_message is not None:
-                    pending_terminal = True
-                    pending_terminal_message = (
-                        pending_terminal_message or terminal_message
-                    )
+                p1_addition = _classify_payload(p1_payload)
+                p2_addition = _classify_payload(p2_payload)
+                p1_metadata.extend(p1_addition)
+                p2_metadata.extend(p2_addition)
+                terminal_message = (
+                    p1_addition.terminal_message or p2_addition.terminal_message
+                )
+                pending_terminal_message = pending_terminal_message or terminal_message
                 continue
             if event_type == "side-chunk":
                 player_slot = str(child_message.get("player", ""))
@@ -2146,22 +2209,18 @@ class LocalBattleStreamSession:
                     child_message.get("payload", "")
                 )
                 if player_slot == "p1":
-                    p1_messages.extend(_payload_to_split_messages(payload))
-                    terminal_message = _payload_terminal_battle_message(payload)
-                    if terminal_message is not None:
-                        pending_terminal = True
-                        pending_terminal_message = (
-                            pending_terminal_message or terminal_message
-                        )
+                    addition = _classify_payload(payload)
+                    p1_metadata.extend(addition)
+                    pending_terminal_message = (
+                        pending_terminal_message or addition.terminal_message
+                    )
                     continue
                 if player_slot == "p2":
-                    p2_messages.extend(_payload_to_split_messages(payload))
-                    terminal_message = _payload_terminal_battle_message(payload)
-                    if terminal_message is not None:
-                        pending_terminal = True
-                        pending_terminal_message = (
-                            pending_terminal_message or terminal_message
-                        )
+                    addition = _classify_payload(payload)
+                    p2_metadata.extend(addition)
+                    pending_terminal_message = (
+                        pending_terminal_message or addition.terminal_message
+                    )
                     continue
                 self._raise_failure(f"Unexpected side-chunk target: {player_slot}")
             if event_type == "end":
@@ -2169,10 +2228,7 @@ class LocalBattleStreamSession:
                     pending_terminal_message
                     or _terminal_battle_message_from_end_payload(child_message)
                 )
-                pending_terminal = pending_terminal or (
-                    pending_terminal_message is not None
-                )
-                if p1_messages or p2_messages:
+                if p1_metadata.split_messages or p2_metadata.split_messages:
                     if await flush_player_messages():
                         return True
                     self._accepting_player_messages = False
@@ -2211,15 +2267,15 @@ class LocalBattleStreamSession:
                     str | list[str] | list[list[str]],
                     message.get("p2_messages") or str(message.get("p2_payload", "")),
                 )
+                p1_metadata = _classify_payload(p1_payload)
+                p2_metadata = _classify_payload(p2_payload)
+                wait_for_dispatch = _payloads_require_dispatch(p1_metadata, p2_metadata)
                 return await self._dispatch_player_payloads(
                     p1_payload,
                     p2_payload,
-                    wait_for_dispatch=(
-                        _payload_requires_dispatch_barrier(p1_payload)
-                        or _payload_requires_dispatch_barrier(p2_payload)
-                        or _payload_has_actionable_request(p1_payload)
-                        or _payload_has_actionable_request(p2_payload)
-                    ),
+                    wait_for_dispatch=wait_for_dispatch,
+                    p1_metadata=p1_metadata,
+                    p2_metadata=p2_metadata,
                 )
             if event_type == "side-chunk":
                 player_slot = str(message.get("player", ""))
@@ -2251,15 +2307,15 @@ class LocalBattleStreamSession:
         kind, _, payload = message.partition("\n")
         if kind == "update":
             p1_lines, p2_lines = _split_update_for_players(payload)
+            p1_metadata = _classify_payload(p1_lines)
+            p2_metadata = _classify_payload(p2_lines)
+            wait_for_dispatch = _payloads_require_dispatch(p1_metadata, p2_metadata)
             return await self._dispatch_player_payloads(
                 p1_lines,
                 p2_lines,
-                wait_for_dispatch=(
-                    _payload_requires_dispatch_barrier(p1_lines)
-                    or _payload_requires_dispatch_barrier(p2_lines)
-                    or _payload_has_actionable_request(p1_lines)
-                    or _payload_has_actionable_request(p2_lines)
-                ),
+                wait_for_dispatch=wait_for_dispatch,
+                p1_metadata=p1_metadata,
+                p2_metadata=p2_metadata,
             )
         if kind == "sideupdate":
             player_slot, _, body = payload.partition("\n")
@@ -2379,23 +2435,36 @@ class LocalBattleStreamSession:
         *,
         terminal: bool | None = None,
         wait_for_dispatch: bool = False,
+        p1_metadata: _PayloadMetadata | None = None,
+        p2_metadata: _PayloadMetadata | None = None,
     ) -> bool:
+        if p1_metadata is None:
+            p1_metadata = _classify_payload(p1_payload)
+        if p2_metadata is None:
+            p2_metadata = _classify_payload(p2_payload)
+
         if terminal or (
             terminal is None
             and (
-                _payload_has_terminal_battle_message(p1_payload)
-                or _payload_has_terminal_battle_message(p2_payload)
+                p1_metadata.terminal_message is not None
+                or p2_metadata.terminal_message is not None
             )
         ):
-            p1_payload = _drop_terminal_action_requests(p1_payload)
-            p2_payload = _drop_terminal_action_requests(p2_payload)
+            p1_payload = _drop_terminal_action_requests_with_metadata(
+                p1_payload, p1_metadata
+            )
+            p2_payload = _drop_terminal_action_requests_with_metadata(
+                p2_payload, p2_metadata
+            )
 
         choice_batch_started = False
         if wait_for_dispatch:
+            _resolve_actionable_request(p1_metadata)
+            _resolve_actionable_request(p2_metadata)
             expected_players = {
                 player_slot
-                for player_slot, payload in (("p1", p1_payload), ("p2", p2_payload))
-                if _payload_has_actionable_request(payload)
+                for player_slot, metadata in (("p1", p1_metadata), ("p2", p2_metadata))
+                if metadata.actionable_request
             }
             if expected_players:
                 if getattr(self, "_pending_choice_batch", None) is not None:
@@ -2430,7 +2499,7 @@ class LocalBattleStreamSession:
             if terminal:
                 self._accepting_player_messages = False
             return terminal
-        return self._stop_after_terminal_payloads(p1_payload, p2_payload)
+        return self._stop_after_payload_metadata(p1_metadata, p2_metadata)
 
     async def _flush_pending_choice_batch(self) -> None:
         pending_batch = getattr(self, "_pending_choice_batch", None)
@@ -2456,10 +2525,8 @@ class LocalBattleStreamSession:
         assert self._worker is not None
         await self._worker.send_battle_lines(lines)
 
-    def _stop_after_terminal_payloads(
-        self, *payloads: str | list[str] | list[list[str]] | object
-    ) -> bool:
-        if any(_payload_has_terminal_battle_message(payload) for payload in payloads):
+    def _stop_after_payload_metadata(self, *metadata: _PayloadMetadata) -> bool:
+        if any(item.terminal_message is not None for item in metadata):
             self._accepting_player_messages = False
             return True
         return False
@@ -2467,7 +2534,7 @@ class LocalBattleStreamSession:
     def _stop_after_terminal_payload(
         self, payload: str | list[str] | list[list[str]] | object
     ) -> bool:
-        return self._stop_after_terminal_payloads(payload)
+        return self._stop_after_payload_metadata(_classify_payload(payload))
 
     def _dispatch_player_payload(
         self,
@@ -2491,6 +2558,24 @@ class LocalBattleStreamSession:
         assert self._dispatch_failure is not None
         if self._dispatch_failure.done():
             self._dispatch_failure.result()
+
+        # This session consumer is the only producer of dispatch tasks. Once all
+        # current dispatches are done, no new dispatch failure can occur until the
+        # next worker payload has been read and dispatched.
+        dispatch_tasks = tuple(self._dispatch_tasks)
+        if not any(not task.done() for task in dispatch_tasks):
+            for task in dispatch_tasks:
+                if task.cancelled():
+                    continue
+                try:
+                    task.result()
+                except Exception as exc:
+                    if not self._dispatch_failure.done():
+                        self._dispatch_failure.set_exception(exc)
+                    self._dispatch_failure.result()
+            if self._dispatch_failure.done():
+                self._dispatch_failure.result()
+            return await self._worker.read_protocol_message(timeout)
 
         read_task = asyncio.create_task(self._worker.read_protocol_message(timeout))
         wait_tasks: set[asyncio.Future] = {read_task}
