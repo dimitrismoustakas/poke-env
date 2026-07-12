@@ -402,6 +402,84 @@ def test_gen_and_format(example_doubles_logs):
     assert battle.format == "gen6doublesou"
 
 
+def test_parse_message_fixture_matches_defensive_copy(example_doubles_logs):
+    original_messages = copy.deepcopy(example_doubles_logs)
+    direct_messages = copy.deepcopy(example_doubles_logs)
+    defensive_messages = copy.deepcopy(example_doubles_logs)
+
+    direct_battle = DoubleBattle("tag", "username", None, gen=6)
+    defensive_battle = DoubleBattle("tag", "username", None, gen=6)
+    direct_battle.player_role = "p1"
+    defensive_battle.player_role = "p1"
+
+    for direct_message, defensive_message in zip(
+        direct_messages, defensive_messages, strict=True
+    ):
+        if direct_message[1] == "win":
+            direct_battle.won_by(direct_message[2])
+            defensive_battle.won_by(defensive_message[2])
+        elif direct_message[1] == "tie":
+            direct_battle.tied()
+            defensive_battle.tied()
+        else:
+            direct_battle.parse_message(direct_message)
+            defensive_battle.parse_message(defensive_message[:])
+
+    assert direct_messages == original_messages
+    assert defensive_messages == original_messages
+    assert direct_battle._replay_data == original_messages
+    assert defensive_battle._replay_data == original_messages
+    assert pickle.dumps(direct_battle) == pickle.dumps(defensive_battle)
+
+    direct_messages[0].append("caller mutation")
+    assert direct_battle._replay_data[0] == original_messages[0]
+
+
+def test_parse_message_copies_only_mutating_move_events():
+    class CopyCountingMessage(list):
+        def __init__(self, values):
+            super().__init__(values)
+            self.full_copy_count = 0
+
+        def __getitem__(self, key):
+            if key == slice(None, None, None):
+                self.full_copy_count += 1
+            return super().__getitem__(key)
+
+    battle = DoubleBattle("tag", "username", None, gen=9)
+    battle.player_role = "p1"
+    battle.switch("p1a: Pikachu", "Pikachu, L50, F", "100/100")
+    battle.switch("p1b: Raichu", "Raichu, L50, F", "100/100")
+    battle.switch("p2a: Absol", "Absol, L50, F", "100/100")
+    battle.switch("p2b: Eevee", "Eevee, L50, F", "100/100")
+
+    damage_values = ["", "-damage", "p2a: Absol", "50/100"]
+    damage_message = CopyCountingMessage(damage_values)
+    battle.parse_message(damage_message)
+
+    assert damage_message.full_copy_count == 1
+    assert damage_message == damage_values
+    assert battle._replay_data[-1] == damage_values
+    assert battle.opponent_active_pokemon[0].current_hp == 50
+
+    battle.active_pokemon[0]._add_move("sleeptalk")
+    move_values = [
+        "",
+        "move",
+        "p1a: Pikachu",
+        "Tackle",
+        "p2a: Absol",
+        "[from] Sleep Talk",
+    ]
+    move_message = CopyCountingMessage(move_values)
+    battle.parse_message(move_message)
+
+    assert move_message.full_copy_count == 2
+    assert move_message == move_values
+    assert battle._replay_data[-1] == move_values
+    assert "tackle" in battle.active_pokemon[0].moves
+
+
 def test_pledge_moves():
     battle = DoubleBattle("tag", "username", MagicMock(), gen=8)
     battle.player_role = "p2"

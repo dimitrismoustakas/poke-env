@@ -565,9 +565,10 @@ class AbstractBattle(ABC):
     def parse_message(self, split_message: List[str]):
         self._replay_data.append(split_message[:])
 
-        # We copy because we directly modify split_message in poke-env; this is to
-        # preserve further usage of this event upstream
-        event = split_message[:]
+        # Most message handlers only read the event. The move handler normalizes
+        # its working list in place, so copy only on that path while preserving the
+        # caller-owned message and the original replay event.
+        event = split_message
 
         if event[1] in self.MESSAGES_TO_IGNORE:
             return
@@ -580,6 +581,7 @@ class AbstractBattle(ABC):
             self._check_damage_message_for_item(event)
             self._check_damage_message_for_ability(event)
         elif event[1] == "move":
+            event = split_message[:]
             pokemon = event[2]
             mon = self.get_pokemon(pokemon)
             use = not mon._dancing
